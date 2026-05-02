@@ -1,0 +1,40 @@
+# Echo TTS API + bundled /ui (requires NVIDIA Container Toolkit: `gpus` below).
+# Usage: docker compose up --build -d
+# CPU-only hosts are not supported by this image (CUDA runtime + GPU inference).
+
+services:
+  echo-tts:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: echo-tts:local
+    ports:
+      - "${ECHO_PORT:-8000}:8000"
+    environment:
+      PORT: "8000"
+      # Set HF_TOKEN, ECHO_*, etc. in a `.env` file in this directory, or: `set -a && source .env && set +a` before `docker compose up`
+    # env_file: .env
+    volumes:
+      # Persist Hugging Face model cache across container restarts
+      - hf-cache:/root/.cache/huggingface
+      # Optional: mount host voices (read/write if you use clone endpoints)
+      # - ./audio_prompts:/app/audio_prompts
+      # Optional: persist UI prefs written by PUT /echo/ui/preferences
+      # - ./echo_ui_preferences.json:/app/echo_ui_preferences.json
+    gpus: all
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+
+volumes:
+  hf-cache:
