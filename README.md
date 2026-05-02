@@ -272,7 +272,16 @@ Build:
 docker build -t echo-tts .
 ```
 
-Run the image (**API + built-in web UI** on one port; models load once):
+**Prebuilt image (GHCR):** CI publishes **`ghcr.io/<owner>/<repo>`** (lowercase) on pushes to **`main`** / **`master`** (`:latest` + SHA) and on **`v*`** version tags. Pull and run:
+
+```bash
+docker pull ghcr.io/<owner>/<repo>:latest
+docker run --rm --gpus all -p 8000:8000 -e PORT=8000 ghcr.io/<owner>/<repo>:latest
+```
+
+Use the repo **Packages** settings to make the image **public** for anonymous pulls, or **`docker login ghcr.io`** with a token that has **`read:packages`**.
+
+Run a locally built image (**API + built-in web UI** on one port; models load once):
 
 ```bash
 docker run --rm --gpus all -p 8000:8000 -e PORT=8000 echo-tts
