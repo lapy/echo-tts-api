@@ -1,0 +1,4 @@
+# Install these only from the CUDA 12.6 wheel index (includes Volta sm_70).
+# Do not use default PyPI torch (often CUDA 13 / cu128+) on V100 — see README "Volta GPUs".
+torch>=2.9.1,<3
+torchaudio>=2.9.1,<3

@@ -7,3 +7,16 @@ venv/
 .idea/
 .vscode/
 api_generation.wav
+user_sampler_presets.json
+echo_ui_preferences.json
+web/node_modules/
+# Vite production bundle — build with `cd web && npm run build`, or use `docker build` (Dockerfile builds UI).
+web/dist/
+
+# Gradio standalone UI temp exports (see gradio_app.py TEMP_AUDIO_DIR)
+temp_gradio_audio/
+
+# Tooling / local caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

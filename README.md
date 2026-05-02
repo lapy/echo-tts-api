@@ -3,14 +3,15 @@
 > Fork: Echo TTS Streaming API — adds a FastAPI server in `api_server.py` that serves `/v1/audio/speech` with streaming PCM output. It keeps upstream behavior but layers chunked text handling, configurable sampling defaults, and runtime switches via `ECHO_*` env vars.
 
 ## Echo TTS Streaming API
-- Run: `python api_server.py` (uses `PORT` env var, default `8000`; FastAPI lifespan loads models and optional compile caches).
-- Optional dependency: install `ffmpeg` (e.g., `apt-get install ffmpeg` or the official builds on Windows/macOS) if you want non-stream outputs encoded to MP3 by default.
+- **Primary surfaces:** OpenAI-compatible **`POST /v1/audio/speech`** and the bundled **`/ui`** app (`GET /echo/ui/meta`, `GET`/`PUT /echo/ui/preferences`). Other routes in `api_server.py` (e.g. Inworld-compatible URLs) are optional.
+- Run: `python api_server.py` (uses `PORT` env var, default `8000`; lifespan loads models once). **Web UI** is static assets under **`/ui`** (built from `web/`). **`/`** redirects to **`/ui/`**. Install deps with **`requirements-torch.txt` (cu126) then `requirements.txt`** — see **Installation** below. Optional legacy Gradio: `pip install -r requirements-gradio.txt` then `python gradio_app.py` (loads the model again — prefer `/ui`).
+- Optional dependency: install **`ffmpeg`** on `PATH`. Typical builds support **`response_format` `mp3`**; **`opus`** additionally needs **libopus**. Without ffmpeg, **`mp3`/`opus` requests fail with 400**, and non-stream requests **default to WAV** instead of MP3.
 - Endpoint: `POST /v1/audio/speech` with body fields:
-  - `input` (text), `voice` (name of a prompt file or folder under `audio_prompts/`; accepts explicit filenames/extensions, base64-encoded audio, or directory names when folder support is on; folders are concatenated—per file with 1s gaps—before encoding), `response_format` (`pcm`, `wav`, or `mp3`), `stream` (bool, default true), `seed`, `extra_body` (sampler overrides such as `block_sizes`, `num_steps`, `chunking_enabled`, `chunk_target_seconds`, etc.).
+  - `input` (text), `voice` (name of a prompt file or folder under `audio_prompts/`; accepts explicit filenames/extensions, base64-encoded audio, or directory names when folder support is on; folders are concatenated—per file with 1s gaps—before encoding), `response_format` (`pcm`, `wav`, `mp3`, or `opus`), `stream` (bool, default true), `seed`, `extra_body` (sampler overrides such as `block_sizes`, `num_steps`, `chunking_enabled`, `chunk_target_seconds`, etc.).
 - Text normalization: prompts are normalized for Echo TTS; `[S1]` is automatically prefixed when missing. Exclamation runs are normalized by default (single `!` -> `.`, multiple `!` -> `!`); toggle via `ECHO_NORMALIZE_EXCLAMATION`.
 - Streaming behavior depends on `response_format`:
   - `pcm` (default for streaming): emits raw PCM bytes live as they are generated, with header `X-Audio-Sample-Rate: 44100`. Ideal for real-time playback.
-  - `wav` or `mp3`: buffers all audio, then returns the complete file at the end of generation. Still benefits from early stop (reduced compute when the model finishes early), but audio is not delivered until generation completes. Useful when you need a standard audio format but want early stop savings.
+  - `wav`, `mp3`, or `opus`: buffers all audio, then returns the complete file at the end of generation. Still benefits from early stop (reduced compute when the model finishes early), but audio is not delivered until generation completes. Useful when you need a standard audio format but want early stop savings. `opus` uses ffmpeg **libopus** (Ogg Opus).
 - Non-stream returns a single response; default format is MP3 when ffmpeg is available (falls back to WAV otherwise).
 - Chunking: enabled by default; long text is split into timed chunks (target 30s, min 20s, max 40s) based on chars/word per second heuristics. Each chunk is synthesized separately and streamed in order; secondary chunks default to the non-stream block shape unless overridden.
 - Streaming defaults: `DEFAULT_BLOCK_SIZES = [32, 128, 480]` and `DEFAULT_NUM_STEPS = [8, 15, 20]` are tuned for real-time streaming with low TTFB (~200–300ms on a 3090 when compiled).
@@ -46,6 +47,18 @@ curl -X POST http://localhost:8000/v1/audio/speech \
     }
   }'
 ```
+- Example (non-stream, Opus response — **requires ffmpeg**):
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  --output out.opus \
+  -d '{
+    "input": "[S1] Hello, this is Opus output.",
+    "voice": "expresso_02_ex03-ex01_calm_005",
+    "stream": false,
+    "response_format": "opus"
+  }'
+```
 - Example (non-stream, WAV response):
 ```bash
 curl -X POST http://localhost:8000/v1/audio/speech \
@@ -60,19 +73,21 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 ```
 
 ### Server Environment Flags
+- **Tensor Cores / GEMM tuning** (applied at startup before models load): **`ECHO_MATMUL_PRECISION`** (default **`high`**) — passed to `torch.set_float32_matmul_precision` (`highest` \| `high` \| `medium`). **`high`** / **`medium`** let FP32 matrix multiplications use Tensor Core–friendly internal math on supported GPUs and silence PyTorch’s “you should set …” warning on startup. **`ECHO_CUDA_TF32`** (default **`1`**) enables TF32 for cuBLAS/cuDNN on **Ampere and newer** (ignored on Volta; harmless). **`ECHO_CUDA_FP16_FAST_MATMUL`** (default **`1`**) keeps FP16 GEMMs on the faster Tensor Core accumulation path when inputs are FP16 (e.g. **`ECHO_PRE_AMPERE`** / **`ECHO_MODEL_DTYPE=float16`** on V100). **`ECHO_CUDNN_BENCHMARK`** (default **`0`**) sets `cudnn.benchmark` — can help fixed-shape inference, sometimes hurts variable shapes.
+- **`ECHO_PRE_AMPERE`** (default **`auto`**) — compatibility for **GPUs before Ampere** (CUDA compute capability **&lt; 8.0**: Pascal, Volta, Turing). **`auto`** enables pre-Ampere dtypes and presets when CUDA device 0 has CC &lt; 8.0 (no env needed on older GPUs). Set **`0`** on Ampere or newer to prefer **bfloat16** / **`ECHO_COMPILE_AE` on** / **`default`** streaming preset without CC detection. Set **`1`** to force pre-Ampere paths on any GPU. When pre-Ampere is active and you do **not** override dtypes: **`ECHO_MODEL_DTYPE=float16`**, **`ECHO_FISH_DTYPE=float16`**, **`ECHO_COMPILE_AE`** defaults to **off**, **`ECHO_PERFORMANCE_PRESET`** defaults to **`low_mid`**.
 - `ECHO_MODEL_REPO` (default `jordand/echo-tts-base`) selects the main model; `ECHO_FISH_REPO` (default `jordand/fish-s1-dac-min`) selects the decoder.
 - `ECHO_DEVICE` / `ECHO_FISH_DEVICE` (default `cuda`) pick devices; set to `cpu` to avoid GPU requirements. `ECHO_MODEL_DTYPE` (default `bfloat16`) and `ECHO_FISH_DTYPE` (default `float32`) control dtypes.
 - `ECHO_COMPILE` (default `0`) toggles `torch.compile` for the main model; `ECHO_COMPILE_AE` (default `1`) separately compiles the decoder; `ECHO_COMPILE_LORA_ONLY` is ignored when LoRA is unused.
 - Cache/logging: `ECHO_CACHE_DIR` (default `/tmp`) and `ECHO_CACHE_VERSION` label saved compile artifacts; `ECHO_CACHE_SPEAKER_ON_GPU` (default `0`) caches speaker latents per device; `ECHO_DEBUG_LOGS` (default `0`) enables verbose timing/debug prints.
 - Chunking/text defaults: `ECHO_CHUNKING` (default `1`), `ECHO_CHUNK_CHARS_PER_SECOND` (default `14`), `ECHO_CHUNK_WORDS_PER_SECOND` (default `2.7`), `ECHO_NORMALIZE_EXCLAMATION` (default `1`) normalizes `!` (single -> `.`, multiple -> `!`).
 - Reference audio handling: `ECHO_MAX_SPEAKER_LATENT_LENGTH` (default `6400`), `ECHO_FOLDER_SUPPORT` (default `1` to allow folder prompts), `ECHO_WARMUP_VOICE` and `ECHO_WARMUP_TEXT` seed optional compile warmup.
-- Optional dependency: ffmpeg (on PATH) is required for `response_format='mp3'`; when present, non-stream defaults to MP3, otherwise WAV.
 - Performance presets (streaming only): `ECHO_PERFORMANCE_PRESET` (default `default`) sets streaming sampler defaults: `default` uses `block_sizes=[32, 128, 480]` / `num_steps=[8, 15, 20]`; `low_mid` keeps those blocks with `num_steps=[8, 10, 15]`; `low` uses `block_sizes=[32, 64, 272, 272]` and `num_steps=[8, 10, 15, 15]`; `equal` uses `block_sizes=[213, 213, 214]` and `num_steps=[15, 15, 15]` for three ~10s blocks with uniform quality. Unknown values fall back to default with a warning; non-streaming uses its own steps.
 - Non-streaming steps: `ECHO_NUM_STEPS_NONSTREAM` (default `20`) controls the fixed non-stream sampler steps (recommended range 10–40); block size stays `640` by default unless overridden via request.
 - VAD-based reroll: `ECHO_VAD_REROLL_ENABLED` (default `0`) enables silence detection using Silero VAD; when a generated block contains silence >= `ECHO_VAD_SILENCE_THRESHOLD_MS` (default `1000`ms), it is regenerated with a new seed up to `ECHO_VAD_MAX_REROLLS` (default `3`) times. This helps mitigate the model's tendency to produce unnaturally long pauses (see Model Quirks below).
 - Note: enabling `torch.compile` (model and/or decoder) can increase peak VRAM; disable `ECHO_COMPILE`/`ECHO_COMPILE_AE` if memory is tight.
 
 ### Performance / VRAM notes
+- **Pre-Ampere GPUs:** defaults already use **`ECHO_PRE_AMPERE=auto`** (FP16 weights and **`low_mid`** streaming when CC &lt; 8.0). Override any **`ECHO_*`** as needed.
 - Quick presets (streaming): set `ECHO_PERFORMANCE_PRESET=low_mid` to reduce steps or `ECHO_PERFORMANCE_PRESET=low` to also shrink blocks; both lower compute/VRAM at some quality cost. Non-streaming always defaults to 20 steps unless you set `ECHO_NUM_STEPS_NONSTREAM` (10–40 recommended).
 - Lower-end GPUs: prefer `ECHO_PERFORMANCE_PRESET=low_mid` (fewer streaming steps) or `ECHO_PERFORMANCE_PRESET=low` (smaller blocks + fewer steps) instead of manual step tweaks.
 - Uniform streaming quality: `ECHO_PERFORMANCE_PRESET=equal` splits generation into three ~10s blocks with 15 steps each, trading faster TTFB for consistent quality across all chunks (no small fast first block).
@@ -206,6 +221,8 @@ Response:
 - `MP3` → MP3 (requires ffmpeg)
 - Other formats return 400 error
 
+*(OpenAI-style **`POST /v1/audio/speech`** supports additional `response_format` values such as **`opus`**; see the Echo TTS Streaming API section above.)*
+
 #### Voice Cloning Security
 Voice cloning is **disabled by default** (`ECHO_INWORLD_CLONE_ENABLED=0`). When enabled:
 - Voice names are sanitized (alphanumeric, underscore, hyphen, space only)
@@ -231,19 +248,94 @@ You are responsible for complying with local laws regarding biometric data and v
 
 ## Installation
 
+Requires Python 3.10+ and a CUDA-capable GPU with at least 8GB VRAM.
+
+Install **`torch` / `torchaudio` from the CUDA 12.6 wheel index first**, then the rest of the dependencies (same order as the Docker image):
+
 ```bash
+pip install --upgrade pip
+pip install --index-url https://download.pytorch.org/whl/cu126 -r requirements-torch.txt
 pip install -r requirements.txt
 ```
 
-Requires Python 3.10+ and a CUDA-capable GPU with at least 8GB VRAM.
+**Volta (V100, sm_70):** PyTorch’s **CUDA 12.8+ and 13.0 Linux wheels omit Volta**; **CUDA 12.6 (`cu126`) binaries still include it** — see [PyTorch CUDA support matrix](https://github.com/pytorch/pytorch/blob/main/RELEASE.md). **`ECHO_PRE_AMPERE`** defaults to **`auto`**, so dtypes and streaming presets match older GPUs without extra env.
+
+On other GPUs you can still follow [pytorch.org](https://pytorch.org/get-started/locally/) for different CUDA stacks; avoid upgrading an existing Volta-safe `torch` to a wheel that drops sm_70.
+
+## Docker
+
+Image: **CUDA 12.6** runtime on **Ubuntu 24.04**. **`torch` / `torchaudio` are installed from the `cu126` index only** (Volta-safe; avoids pulling default PyPI CUDA builds that skip sm_70). Requires a host NVIDIA driver that supports CUDA 12.x.
+
+Build:
+
+```bash
+docker build -t echo-tts .
+```
+
+Run the image (**API + built-in web UI** on one port; models load once):
+
+```bash
+docker run --rm --gpus all -p 8000:8000 -e PORT=8000 echo-tts
+```
+
+- **Web UI:** `http://localhost:8000/ui/` (or `/` → `/ui/`)
+- **API docs:** `http://localhost:8000/docs`
+
+The Dockerfile builds **`web/dist`** in a **`webbuilder`** stage (**`npm ci`** + **`vite build`**) and copies it into the runtime image — you do **not** need a checked-in `web/dist` on the host. For production, mount a Hugging Face cache if models should persist across restarts (e.g. **`-v hf_cache:/root/.cache/huggingface`** and set **`HF_HOME`** / **`TRANSFORMERS_CACHE`** as needed), and consider **`HF_TOKEN`** for Hub rate limits. To hack the UI locally with **live reload**, see **Web UI (development)** below.
+
+Optional legacy **Gradio** (extra dependency + second model load if run beside the API):
+
+```bash
+pip install -r requirements-gradio.txt
+python gradio_app.py
+```
+
+**Ampere or newer** (CC ≥ 8.0): optional **`ECHO_PRE_AMPERE=0`** so dtypes default to **bfloat16** and streaming uses the **`default`** preset without relying on CC detection.
+
+```bash
+docker run --rm --gpus all -p 8000:8000 \
+  -e ECHO_PRE_AMPERE=0 \
+  echo-tts
+```
+
+Install a **PyTorch build** that includes your GPU’s architecture (see [pytorch.org](https://pytorch.org/get-started/locally/)). If the driver is older than the CUDA user libraries in the image, upgrade the host NVIDIA driver.
+
+Models download from Hugging Face on first start; consider mounting a cache volume (`HF_HOME` / `TRANSFORMERS_CACHE`).
 
 ## Quick Start
 
-### Gradio UI
+### Web UI
+
+After **`python api_server.py`**, open **`http://localhost:8000/ui/`** (served from `web/dist`; same process as the API). **`web/dist` is not checked in** — run **`cd web && npm install && npm run build`** once (or use **Docker**, which builds the UI in the image).
+
+The UI exposes **output format** (**`wav` / `mp3` / `opus` / `pcm`** → OpenAI `response_format`), **sampler presets**, **CFG / chunking**, and **raw `extra_body` JSON** (Echo-specific knobs not in the OpenAI schema). **`opus`** needs ffmpeg on the server (same as **`mp3`**). Settings can be saved to the server via **`PUT /echo/ui/preferences`** (default file **`echo_ui_preferences.json`** next to `api_server.py`; override with **`ECHO_UI_PREFS_PATH`**). **`GET /echo/ui/meta`** lists sampler presets and defaults for the form.
+
+**Development (Vite HMR + API reload):**
 
 ```bash
+# Terminal 1 — API with auto-reload on Python changes
+uvicorn api_server:app --reload --host 0.0.0.0 --port 8000
+
+# Terminal 2 — UI with live reload on save (proxies /v1 and /echo to the API)
+cd web && npm install && npm run dev
+```
+
+Then open the URL Vite prints (e.g. **`http://localhost:5173/ui/`**).
+
+Rebuild production assets after editing `web/`:
+
+```bash
+cd web && npm run build
+```
+
+### Legacy Gradio UI (optional)
+
+```bash
+pip install -r requirements-gradio.txt
 python gradio_app.py
 ```
+
+User presets live in `user_sampler_presets.json` (gitignored). Prefer **`extra_body` JSON** on the main web UI or curl/API clients.
 
 ### Python API
 

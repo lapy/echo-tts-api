@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 import torchaudio
+from cuda_perf import configure_cuda_performance
 from utils import preprocess_text, chunk_text_by_time
 from inference import (
     PCAState,
@@ -65,15 +66,58 @@ DEFAULT_NUM_STEPS_NONSTREAM = int(os.getenv("ECHO_NUM_STEPS_NONSTREAM", "20"))
 DEBUG_LOGS_ENABLED = os.getenv("ECHO_DEBUG_LOGS", "0") == "1"
 FFMPEG_PATH = shutil.which("ffmpeg")
 
+
+def _pre_ampere_from_env() -> bool:
+    """Pascal / Volta / Turing (CC < 8.0): prefer FP16 + lighter streaming defaults.
+
+    Default ``ECHO_PRE_AMPERE`` is ``auto``: enable pre-Ampere paths when CUDA device 0
+    has CC < 8.0. Set ``ECHO_PRE_AMPERE=0`` on Ampere+ to prefer bf16-oriented defaults
+    without CC detection. Set ``ECHO_PRE_AMPERE=1`` to force pre-Ampere regardless of GPU.
+    """
+    raw = (os.getenv("ECHO_PRE_AMPERE") or "auto").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw == "auto":
+        try:
+            if torch.cuda.is_available():
+                major, minor = torch.cuda.get_device_capability(0)
+                return (major, minor) < (8, 0)
+        except Exception:
+            pass
+        return False
+    return False
+
+
+_PRE_AMPERE = _pre_ampere_from_env()
+
+
+def _env_str_pre_ampere(key: str, *, pre_ampere: str, standard: str) -> str:
+    raw = os.getenv(key)
+    if raw is not None and str(raw).strip() != "":
+        return str(raw).strip()
+    return pre_ampere if _PRE_AMPERE else standard
+
+
 MODEL_REPO = os.getenv("ECHO_MODEL_REPO", "jordand/echo-tts-base") # Model repo overriden when using LoRA
 PCA_REPO = os.getenv("ECHO_PCA_REPO", MODEL_REPO)
 FISH_REPO = os.getenv("ECHO_FISH_REPO", "jordand/fish-s1-dac-min")
 DEVICE = os.getenv("ECHO_DEVICE", "cuda")
 FISH_DEVICE = os.getenv("ECHO_FISH_DEVICE", DEVICE)
-MODEL_DTYPE = os.getenv("ECHO_MODEL_DTYPE", "bfloat16")  # keep half-precision by default to avoid doubling VRAM
-FISH_DTYPE = os.getenv("ECHO_FISH_DTYPE", "float32")     # keep decoder in fp32 by default for quality
+MODEL_DTYPE = _env_str_pre_ampere(
+    "ECHO_MODEL_DTYPE",
+    pre_ampere="float16",
+    standard="bfloat16",
+)
+FISH_DTYPE = _env_str_pre_ampere(
+    "ECHO_FISH_DTYPE",
+    pre_ampere="float16",
+    standard="float32",
+)
 USE_COMPILE = os.getenv("ECHO_COMPILE", "0") == "1" # Takes several minutes to compile but cuts TTFB by 100~200ms
-COMPILE_AE = os.getenv("ECHO_COMPILE_AE", "1") == "1"
+COMPILE_AE = os.getenv(
+    "ECHO_COMPILE_AE",
+    "0" if _PRE_AMPERE else "1",
+) == "1"
 CACHE_SPEAKER_ON_GPU = os.getenv("ECHO_CACHE_SPEAKER_ON_GPU", "0") == "1" # Provides speed-up by 20ms~60ms TTFB per request at cost of VRAM usage
 CACHE_VERSION = os.getenv("ECHO_CACHE_VERSION", "v1_0")
 CACHE_DIR = Path(os.getenv("ECHO_CACHE_DIR", "/tmp"))
@@ -96,8 +140,9 @@ INWORLD_CLONE_ENABLED = os.getenv("ECHO_INWORLD_CLONE_ENABLED", "0") == "1"
 INWORLD_CLONE_SEPARATOR = "__"  # Inworld format: {workspace}__{voice}
 INWORLD_MAX_SAMPLE_SIZE = int(os.getenv("ECHO_INWORLD_MAX_SAMPLE_SIZE", str(100 * 1024 * 1024)))  # 100 MB
 INWORLD_DEFAULT_WORKSPACE = os.getenv("ECHO_INWORLD_DEFAULT_WORKSPACE", "default")
-# Performance presets
-_PERFORMANCE_PRESET_RAW = os.getenv("ECHO_PERFORMANCE_PRESET", "default")
+# Performance presets (pre-Ampere defaults to low_mid streaming unless overridden)
+_PERF_PRESET_DEFAULT = "low_mid" if _PRE_AMPERE else "default"
+_PERFORMANCE_PRESET_RAW = os.getenv("ECHO_PERFORMANCE_PRESET", _PERF_PRESET_DEFAULT)
 PERFORMANCE_PRESET = _PERFORMANCE_PRESET_RAW.strip().lower().replace("-", "_")
 _PERFORMANCE_PRESETS = {
     "default": {"block_sizes": [32, 128, 480], "num_steps": [8, 15, 20]},
@@ -113,6 +158,11 @@ elif PERFORMANCE_PRESET not in {"", "default"}:
     print(
         f"⚠️ Unknown ECHO_PERFORMANCE_PRESET '{_PERFORMANCE_PRESET_RAW}'; using default sampler settings."
     )
+if _PRE_AMPERE:
+    print(
+        "[echo] Pre-Ampere mode: float16 dtypes unless ECHO_MODEL_DTYPE / ECHO_FISH_DTYPE set; "
+        "ECHO_COMPILE_AE defaults off; streaming preset low_mid unless ECHO_PERFORMANCE_PRESET set."
+    )
 # LoRA settings
 LORA_FIRST_BLOCK = os.getenv("ECHO_LORA_FIRST_BLOCK", "0") == "1"
 LORA_REPO = os.getenv("ECHO_LORA_REPO", "")
@@ -127,6 +177,9 @@ if LORA_FIRST_BLOCK:
 # Keep torch.compile caches on restarts similar to test_ttfb_optimization.py
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/tmp/torchinductor_cache")
 os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+
+# Tensor Core–friendly FP32/FP16 GEMM + cuDNN settings (before any model loads).
+configure_cuda_performance()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -1077,6 +1130,54 @@ def _encode_mp3_from_pcm(pcm: bytes, sample_rate: int) -> bytes:
     return bytes(result.stdout)
 
 
+def _encode_opus_from_pcm(pcm: bytes, sample_rate: int) -> bytes:
+    """
+    Encode raw PCM to Ogg Opus using ffmpeg libopus (stdin/stdout).
+    Requires ffmpeg with libopus; otherwise raises HTTPException.
+    """
+    if not FFMPEG_PATH:
+        raise HTTPException(
+            status_code=400,
+            detail="response_format='opus' requires ffmpeg in PATH",
+        )
+    try:
+        result = subprocess.run(
+            [
+                FFMPEG_PATH,
+                "-v",
+                "error",
+                "-f",
+                "s16le",
+                "-ar",
+                str(sample_rate),
+                "-ac",
+                "1",
+                "-i",
+                "-",
+                "-c:a",
+                "libopus",
+                "-b:a",
+                "96k",
+                "-application",
+                "audio",
+                "-f",
+                "opus",
+                "-",
+            ],
+            input=pcm,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Failed to encode opus") from exc
+    if result.returncode != 0 or not result.stdout:
+        err = (result.stderr or b"").decode(errors="ignore").strip()
+        _log_debug(f"[opus] ffmpeg encode error rc={result.returncode} stderr={err}")
+        raise HTTPException(status_code=500, detail="Failed to encode opus")
+    return bytes(result.stdout)
+
+
 def _save_debug_wav(tensor: torch.Tensor, path: str) -> None:
     try:
         torchaudio.save(path, tensor.detach().cpu().unsqueeze(0).float(), SAMPLE_RATE)
@@ -1868,7 +1969,7 @@ class SpeechRequest(BaseModel):
     voice: str = Field(..., description="Voice name (audio_prompts/prompt_audio/extra_prompt_audio) or base64 audio")
     response_format: Optional[str] = Field(
         default=None,
-        description="pcm only for streaming; non-stream supports pcm/wav/mp3 (defaults to mp3 if ffmpeg is available, else wav).",
+        description="pcm only for streaming; non-stream supports pcm/wav/mp3/opus (opus requires ffmpeg libopus; defaults to mp3 if ffmpeg is available, else wav).",
     )
     stream: bool = Field(default=True)
     extra_body: Dict[str, Any] = Field(default_factory=dict, description="Optional overrides (seed, sampler params, etc.)")
@@ -1979,16 +2080,90 @@ def _resolve_response_format(requested: Optional[str], stream: bool) -> str:
     if requested is None or str(requested).strip() == "":
         return "pcm" if stream else ("mp3" if FFMPEG_PATH else "wav")
     fmt = str(requested).strip().lower()
-    if fmt not in {"pcm", "wav", "mp3"}:
-        raise HTTPException(status_code=400, detail="response_format must be one of 'pcm', 'wav', 'mp3'")
-    if fmt == "mp3" and not FFMPEG_PATH:
-        raise HTTPException(status_code=400, detail="response_format='mp3' requires ffmpeg in PATH")
+    if fmt not in {"pcm", "wav", "mp3", "opus"}:
+        raise HTTPException(status_code=400, detail="response_format must be one of 'pcm', 'wav', 'mp3', 'opus'")
+    if fmt in ("mp3", "opus") and not FFMPEG_PATH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"response_format='{fmt}' requires ffmpeg in PATH",
+        )
     return fmt
 
 
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/")
+def root_index():
+    """Minimal web UI is served under /ui (built from web/)."""
+    from fastapi.responses import RedirectResponse
+
+    return RedirectResponse(url="/ui/")
+
+
+UI_PREFS_PATH = Path(
+    os.getenv("ECHO_UI_PREFS_PATH", str(Path(__file__).resolve().parent / "echo_ui_preferences.json"))
+)
+_UI_PREFS_MAX_BYTES = int(os.getenv("ECHO_UI_PREFS_MAX_BYTES", str(512 * 1024)))
+
+
+@app.get("/echo/ui/meta")
+def echo_ui_meta() -> Dict[str, Any]:
+    """Expose sampler presets and defaults for the bundled web UI (not part of OpenAI API)."""
+    return {
+        "version": 1,
+        "sampler_presets": {k: dict(v) for k, v in _PERFORMANCE_PRESETS.items()},
+        "server_active_preset": PERFORMANCE_PRESET if PERFORMANCE_PRESET in _PERFORMANCE_PRESETS else None,
+        "defaults": {
+            "chunking_enabled": CHUNKING_ENABLED,
+            "chunk_target_seconds": 30.0,
+            "chunk_min_seconds": 20.0,
+            "chunk_max_seconds": 40.0,
+            "chunk_chars_per_second": CHUNK_CHARS_PER_SECOND,
+            "chunk_words_per_second": CHUNK_WORDS_PER_SECOND,
+            "cfg_scale_text": DEFAULT_CFG_TEXT,
+            "cfg_scale_speaker": DEFAULT_CFG_SPEAKER,
+            "cfg_min_t": DEFAULT_CFG_MIN_T,
+            "cfg_max_t": DEFAULT_CFG_MAX_T,
+            "num_steps_nonstream": DEFAULT_NUM_STEPS_NONSTREAM,
+        },
+    }
+
+
+@app.get("/echo/ui/preferences")
+def get_echo_ui_preferences() -> Dict[str, Any]:
+    """Load persisted web UI settings (JSON file on the server)."""
+    if not UI_PREFS_PATH.is_file():
+        return {"version": 1, "ui": {}, "expert_json": ""}
+    try:
+        raw_txt = UI_PREFS_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw_txt)
+        if not isinstance(data, dict):
+            return {"version": 1, "ui": {}, "expert_json": ""}
+        data.setdefault("version", 1)
+        data.setdefault("ui", {})
+        data.setdefault("expert_json", "")
+        return data
+    except (json.JSONDecodeError, OSError):
+        return {"version": 1, "ui": {}, "expert_json": ""}
+
+
+@app.put("/echo/ui/preferences")
+def put_echo_ui_preferences(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Persist web UI settings for knobs that are not OpenAI-standard (sampler, chunking, expert JSON)."""
+    try:
+        encoded = json.dumps(body, indent=2).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"invalid JSON payload: {exc}") from exc
+    if len(encoded) > _UI_PREFS_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="preferences payload too large")
+    try:
+        UI_PREFS_PATH.write_bytes(encoded)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"ok": True}
 
 
 @app.get("/v1/voices")
@@ -2004,6 +2179,11 @@ def list_voices() -> Dict[str, Any]:
 @app.post("/v1/audio/speech")
 def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> StreamingResponse:
     route_start = time.time()
+    if not str(payload.voice).strip():
+        raise HTTPException(
+            status_code=400,
+            detail="voice is required (pick a voice from /v1/voices or pass base64 audio).",
+        )
     # Extract seed from extra_body, default to random (-1)
     seed = int(payload.extra_body.get("seed", -1))
     if seed < 0:
@@ -2079,8 +2259,8 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
         chunk_cfgs = [sampler_cfg for _ in chunks]
 
     if payload.stream:
-        # For wav/mp3 format, we must collect all chunks then convert; for pcm, stream directly
-        stream_buffered = response_format in ("wav", "mp3")
+        # For wav/mp3/opus format, we must collect all chunks then convert; for pcm, stream directly
+        stream_buffered = response_format in ("wav", "mp3", "opus")
         collected: Optional[bytearray] = bytearray() if (DEBUG_LOGS_ENABLED or stream_buffered) else None
         disconnect_exception: type[Exception] = type("ClientDisconnected", (Exception,), {})
 
@@ -2128,7 +2308,7 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
                         emitted = True
                         if collected is not None:
                             collected.extend(chunk)
-                        # For wav/mp3 format, don't yield chunks - we'll convert and yield at end
+                        # For wav/mp3/opus format, don't yield chunks - we'll convert and yield at end
                         if not stream_buffered:
                             yield chunk
                 except disconnect_exception:
@@ -2151,15 +2331,21 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
             finally:
                 _close_iter(stream_iter)
 
-            # For wav/mp3 format, convert accumulated PCM and yield at end
+            # For wav/mp3/opus format, convert accumulated PCM and yield at end
             if stream_buffered and collected:
                 pcm_bytes = bytes(collected)
                 if response_format == "wav":
                     yield _pcm16_to_wav_bytes(pcm_bytes, SAMPLE_RATE)
                 elif response_format == "mp3":
                     yield _encode_mp3_from_pcm(pcm_bytes, SAMPLE_RATE)
+                elif response_format == "opus":
+                    yield _encode_opus_from_pcm(pcm_bytes, SAMPLE_RATE)
 
-        stream_media_type = {"wav": "audio/wav", "mp3": "audio/mpeg"}.get(response_format, "application/octet-stream")
+        stream_media_type = {
+            "wav": "audio/wav",
+            "mp3": "audio/mpeg",
+            "opus": "audio/opus",
+        }.get(response_format, "application/octet-stream")
         response = StreamingResponse(
             _generator(),
             media_type=stream_media_type,
@@ -2234,6 +2420,9 @@ def create_speech(request: Request, payload: SpeechRequest = Body(...)) -> Strea
     elif response_format == "mp3":
         response_bytes = _encode_mp3_from_pcm(audio_tensor, SAMPLE_RATE)
         media_type = "audio/mpeg"
+    elif response_format == "opus":
+        response_bytes = _encode_opus_from_pcm(audio_tensor, SAMPLE_RATE)
+        media_type = "audio/opus"
 
     return StreamingResponse(
         content=iter([response_bytes]),
@@ -2337,7 +2526,7 @@ def inworld_synthesize(payload: InworldSynthesizeRequest):
     else:
         return _inworld_error_response(
             INWORLD_ERROR_INVALID_ARGUMENT,
-            f"Unsupported audioEncoding '{audio_encoding}'. Only LINEAR16 and MP3 are supported."
+            f"Unsupported audioEncoding '{audio_encoding}'. Only LINEAR16 and MP3 are supported.",
         )
 
     # Check MP3 availability
@@ -2423,7 +2612,7 @@ def inworld_synthesize_stream(request: Request, payload: InworldSynthesizeReques
     else:
         return _inworld_stream_error_response(
             INWORLD_ERROR_INVALID_ARGUMENT,
-            f"Unsupported audioEncoding '{audio_encoding}'. Only LINEAR16 and MP3 are supported."
+            f"Unsupported audioEncoding '{audio_encoding}'. Only LINEAR16 and MP3 are supported.",
         )
 
     # Check MP3 availability
@@ -2790,6 +2979,23 @@ def inworld_delete_voice_v2(voice_id: str, etag: Optional[str] = None):
         workspace = INWORLD_DEFAULT_WORKSPACE
         voice = voice_id
     return inworld_delete_voice(workspace, voice, etag)
+
+
+def _mount_web_ui() -> None:
+    """Serve built static UI from web/dist at /ui."""
+    from fastapi.staticfiles import StaticFiles
+
+    dist = Path(__file__).resolve().parent / "web" / "dist"
+    if not dist.is_dir():
+        print(
+            f"⚠️ Web UI not found ({dist}). "
+            "Dev: cd web && npm install && npm run dev — Prod: npm run build"
+        )
+        return
+    app.mount("/ui", StaticFiles(directory=str(dist), html=True), name="ui")
+
+
+_mount_web_ui()
 
 
 if __name__ == "__main__":

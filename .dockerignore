@@ -1,0 +1,30 @@
+.git
+.github
+__pycache__
+*.py[cod]
+.venv
+venv
+.env
+.idea
+.vscode
+*.md
+api_generation.wav
+user_sampler_presets.json
+temp_gradio_audio
+.cursor
+
+# Frontend — host installs / builds must not bloat the context or override the image build.
+web/node_modules/
+web/dist/
+
+# Runtime-only files (bind-mount at deploy time instead).
+echo_ui_preferences.json
+
+# Gradio-only (api_server + `/ui` only in this image)
+gradio_app.py
+requirements-gradio.txt
+text_presets.txt
+sampler_presets.json
+
+# Example / scratch scripts not imported by api_server
+inference_blockwise.py

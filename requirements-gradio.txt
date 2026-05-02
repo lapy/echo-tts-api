@@ -1,0 +1,2 @@
+# Optional legacy UI — loads models separately from api_server.
+gradio==5.49.1

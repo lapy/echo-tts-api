@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Echo TTS</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hdr">
+        <h1>Echo TTS</h1>
+        <p class="lead">
+          Same FastAPI process as <code>/v1/audio/speech</code>. Maps to JSON (<code>extra_body</code>). <strong>Save settings</strong> → server file; draft text → browser only.
+          <button type="button" class="tip-btn tip-inline" title="Everything below becomes POST /v1/audio/speech: input, voice, stream, response_format, and extra_body keys. Preferences persist to echo_ui_preferences.json (ECHO_UI_PREFS_PATH). Draft textarea uses localStorage." aria-label="More about this page">ⓘ</button>
+        </p>
+      </header>
+
+      <section class="card">
+        <h2 class="card-title">Text</h2>
+        <details class="section-help">
+          <summary>About the text field</summary>
+          <div class="card-doc">
+            <p>
+              Becomes <code>input</code>. Segment tags like <code>[S1]</code> / <code>[S2]</code> improve pacing; the server normalizes if omitted.
+            </p>
+            <ul class="help-list">
+              <li><strong>Draft:</strong> stored in <code>localStorage</code> only — not in prefs JSON.</li>
+              <li><strong>Long copy:</strong> use chunking so synthesis stays in speech-sized slices.</li>
+              <li><strong>!</strong> normalization may change lone exclamations (server env <code>ECHO_NORMALIZE_EXCLAMATION</code>).</li>
+            </ul>
+          </div>
+        </details>
+        <label class="field">
+          <textarea id="text" rows="6" placeholder='[S1] Hello from Echo…' aria-describedby="sr-text"></textarea>
+          <span id="sr-text" class="sr-only">Full paragraph becomes API input. Tags like [S1] recommended. Draft saved only in this browser.</span>
+        </label>
+      </section>
+
+      <section class="card">
+        <h2 class="card-title">Voice</h2>
+        <details class="section-help">
+          <summary>About voices</summary>
+          <div class="card-doc">
+            <p>
+              Maps to <code>voice</code>. Must match a stem or folder under <code>audio_prompts/</code>, <code>prompt_audio/</code>, or <code>extra_prompt_audio/</code> (or base64 — not listed here). Options come from <code>GET /v1/voices</code>.
+            </p>
+            <ul class="help-list">
+              <li><strong>Reload list:</strong> rescans server folders after you add files.</li>
+              <li><strong>Quality:</strong> cleaner references track better; very short clips vary more.</li>
+              <li><strong>Save settings</strong> stores the selected id.</li>
+            </ul>
+          </div>
+        </details>
+        <div class="row2">
+          <label class="field grow">
+            <span class="lbl-row">
+              <span class="lbl" id="lbl-voice">Reference voice</span>
+              <button type="button" class="tip-btn" title="Stems and folder names from the API. Empty list = no audio files in voice dirs on the server." aria-label="Help: reference voice">ⓘ</button>
+            </span>
+            <select id="voice" aria-labelledby="lbl-voice" aria-describedby="sr-voice"></select>
+            <span id="sr-voice" class="sr-only">Lists stems / folder names from GET /v1/voices. Empty means no wav/mp3/etc. found in configured voice directories.</span>
+          </label>
+          <button type="button" id="reload-voices" class="btn secondary" title="Rescan audio_prompts, prompt_audio, extra_prompt_audio on the server">Reload list</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 class="card-title">Output</h2>
+        <details class="section-help">
+          <summary>About stream, format &amp; seed</summary>
+          <div class="card-doc">
+            <p>Sets <code>stream</code>, <code>response_format</code>, and optional <code>extra_body.seed</code>.</p>
+            <ul class="help-list">
+              <li><strong>Stream on:</strong> incremental audio, lower TTFB. Streaming wav/mp3/opus still buffers for valid headers.</li>
+              <li><strong>Stream off:</strong> one-shot; use non-stream steps. Block size follows server non-stream path.</li>
+              <li><strong>PCM:</strong> raw s16le 44.1 kHz — browsers rarely play without extra code; use wav/mp3/opus here.</li>
+              <li><strong>MP3:</strong> needs ffmpeg on the server.</li>
+            </ul>
+          </div>
+        </details>
+        <div class="row4">
+          <div class="chk-wrap">
+            <label class="chk">
+              <input type="checkbox" id="stream" checked aria-labelledby="lbl-stream" aria-describedby="sr-stream" />
+              <span id="lbl-stream">Stream audio</span>
+            </label>
+            <button type="button" class="tip-btn tip-chk" title="Checked: stream true — incremental generation, earlier first audio. Unchecked: single buffered response; often higher quality per request but slower TTFB." aria-label="Help: streaming">ⓘ</button>
+            <span id="sr-stream" class="sr-only">stream true = incremental; false = one buffered generation.</span>
+          </div>
+          <label class="field tight">
+            <span class="lbl-row">
+              <span class="lbl" id="lbl-format">Format</span>
+              <button type="button" class="tip-btn" title="response_format: wav, mp3, opus, or pcm. Opus needs ffmpeg (libopus). Streaming wav/mp3/opus may buffer until segments complete; pcm streams raw bytes." aria-label="Help: format">ⓘ</button>
+            </span>
+            <select id="format" aria-labelledby="lbl-format" aria-describedby="sr-format">
+              <option value="wav">wav</option>
+              <option value="mp3">mp3</option>
+              <option value="opus">opus</option>
+              <option value="pcm">pcm</option>
+            </select>
+            <span id="sr-format" class="sr-only">Sent as response_format. wav, mp3, and opus work in the audio player when the browser supports them; pcm is raw samples.</span>
+          </label>
+          <label class="field tight">
+            <span class="lbl-row">
+              <span class="lbl" id="lbl-seed">Seed</span>
+              <button type="button" class="tip-btn" title="Integer in extra_body for reproducibility. Leave empty for random seed; VAD reroll on the server may change rerolls." aria-label="Help: seed">ⓘ</button>
+            </span>
+            <input type="text" id="seed" placeholder="random" inputmode="numeric" autocomplete="off" aria-labelledby="lbl-seed" aria-describedby="sr-seed" />
+            <span id="sr-seed" class="sr-only">Optional integer seed. Blank = random.</span>
+          </label>
+        </div>
+        <details id="nonstream-hint" class="hint-banner hidden">
+          <summary>Non-stream playback &amp; steps</summary>
+          <p class="hint-banner-body">
+            Pick <strong>wav</strong>, <strong>mp3</strong>, or <strong>opus</strong> for the player below. <strong>Steps</strong> sets <code>extra_body.num_steps</code> for the non-stream sampler (often ~10–40).
+          </p>
+        </details>
+        <div class="row4 hidden" id="nonstream-row">
+          <label class="field tight">
+            <span class="lbl-row">
+              <span class="lbl" id="lbl-steps-ns">Steps (non-stream)</span>
+              <button type="button" class="tip-btn" title="Higher = usually heavier compute and different detail; balance against latency and VRAM." aria-label="Help: non-stream steps">ⓘ</button>
+            </span>
+            <input type="number" id="steps-nonstream" min="1" max="80" step="1" aria-labelledby="lbl-steps-ns" aria-describedby="sr-steps-ns" />
+            <span id="sr-steps-ns" class="sr-only">Non-stream diffusion steps; typical range roughly 10 to 40.</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 class="card-title">Sampler</h2>
+        <details class="section-help">
+          <summary>About CFG &amp; presets</summary>
+          <div class="card-doc">
+            <p>
+              Populates <code>cfg_scale_text</code>, <code>cfg_scale_speaker</code>, <code>cfg_min_t</code>, <code>cfg_max_t</code>. Presets add <code>block_sizes</code> / <code>num_steps</code> when streaming.
+            </p>
+            <p><strong>Presets:</strong> default = balanced; low_mid = fewer steps on later blocks; low = smaller blocks / VRAM; equal = uniform ~10s blocks. Empty preset = server env defaults.</p>
+            <p class="fine-print">Expert JSON overrides any duplicate keys.</p>
+          </div>
+        </details>
+        <label class="field">
+          <span class="lbl-row">
+            <span class="lbl" id="lbl-preset">Streaming preset</span>
+            <button type="button" class="tip-btn" title="Only when Stream is on. Sends block_sizes and num_steps in extra_body. Pick Server default to omit overrides (host ECHO_PERFORMANCE_PRESET / pre-Ampere defaults apply)." aria-label="Help: streaming preset">ⓘ</button>
+          </span>
+          <select id="sampler-preset" aria-labelledby="lbl-preset" aria-describedby="sr-preset">
+            <option value="">Server default (no block/step override)</option>
+            <option value="default">Balanced — default</option>
+            <option value="low_mid">Faster — low_mid</option>
+            <option value="low">Low VRAM — low</option>
+            <option value="equal">Uniform blocks — equal</option>
+          </select>
+          <span id="sr-preset" class="sr-only">Streaming only. Overrides block and step schedule for multi-block generation.</span>
+        </label>
+        <div class="grid2">
+          <label class="field">
+            <span class="lbl-row">
+              <span class="lbl" id="lbl-cfgt">CFG text</span>
+              <button type="button" class="tip-btn" title="cfg_scale_text: guidance strength toward text vs unconditional. Higher often follows transcript more; extremes can sound stiff." aria-label="Help: CFG text">ⓘ</button>
+            </span>
+            <input type="number" id="cfg-text" step="0.1" min="0" aria-labelledby="lbl-cfgt" aria-describedby="sr-cfgt" />
+            <span id="sr-cfgt" class="sr-only">Classifier-free guidance scale for text conditioning.</span>
+          </label>
+          <label class="field">
+            <span class="lbl-row">
+              <span class="lbl" id="lbl-cfgs">CFG speaker</span>
+              <button type="button" class="tip-btn" title="cfg_scale_speaker: guidance toward reference voice vs unconditional. Higher locks timbre more; too high can sound harsh." aria-label="Help: CFG speaker">ⓘ</button>
+            </span>
+            <input type="number" id="cfg-speaker" step="0.1" min="0" aria-labelledby="lbl-cfgs" aria-describedby="sr-cfgs" />
+            <span id="sr-cfgs" class="sr-only">Classifier-free guidance scale for speaker conditioning.</span>
+          </label>
+          <label class="field">
+            <span class="lbl-row">
+              <span class="lbl" id="lbl-cfgmint">CFG min t</span>
+              <button type="button" class="tip-btn" title="cfg_min_t: lower end (0–1) of the timestep range where CFG is applied along the diffusion schedule." aria-label="Help: CFG min t">ⓘ</button>
+            </span>
+            <input type="number" id="cfg-min-t" step="0.05" min="0" max="1" aria-labelledby="lbl-cfgmint" aria-describedby="sr-cfgmint" />
+            <span id="sr-cfgmint" class="sr-only">Lower bound of CFG timestep band.</span>
+          </label>
+          <label class="field">
+            <span class="lbl-row">
+              <span class="lbl" id="lbl-cfgmaxt">CFG max t</span>
+              <button type="button" class="tip-btn" title="cfg_max_t: upper end (0–1) of the CFG timestep band; together with min t defines where scaling runs." aria-label="Help: CFG max t">ⓘ</button>
+            </span>
+            <input type="number" id="cfg-max-t" step="0.05" min="0" max="1" aria-labelledby="lbl-cfgmaxt" aria-describedby="sr-cfgmaxt" />
+            <span id="sr-cfgmaxt" class="sr-only">Upper bound of CFG timestep band.</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2 class="card-title">Long text chunking</h2>
+        <details class="section-help">
+          <summary>About chunking</summary>
+          <div class="card-doc">
+            <p>Maps to chunking_enabled, chunk_target_seconds, min, max; rates default from server unless overridden in Expert JSON.</p>
+            <ul class="help-list">
+              <li><strong>Why:</strong> splits long scripts into timed slices for stable latency.</li>
+              <li><strong>Target vs min/max:</strong> splitter aims near target seconds within bounds.</li>
+              <li><strong>Off:</strong> one giant job — risk of OOM or long stalls.</li>
+            </ul>
+          </div>
+        </details>
+        <div class="chk-wrap row-chunk">
+          <label class="chk">
+            <input type="checkbox" id="chunk-enabled" checked aria-labelledby="lbl-chunk" aria-describedby="sr-chunk-en" />
+            <span id="lbl-chunk">Enable chunking</span>
+          </label>
+          <button type="button" class="tip-btn tip-chk" title="chunking_enabled: off = synthesize entire input as one job (within model limits)." aria-label="Help: chunking toggle">ⓘ</button>
+          <span id="sr-chunk-en" class="sr-only">When off, no automatic time-based splitting.</span>
+        </div>
+        <div class="grid3">
+          <label class="field">
+            <span class="lbl-row">
+              <span class="lbl" id="lbl-chunk-t">Target chunk (sec)</span>
+              <button type="button" class="tip-btn" title="chunk_target_seconds (seconds): desired approximate spoken length per chunk; raise if cuts feel too aggressive." aria-label="Help: chunk target">ⓘ</button>
+            </span>
+            <input type="number" id="chunk-target" step="1" min="5" aria-labelledby="lbl-chunk-t" aria-describedby="sr-chunk-t" />
+            <span id="sr-chunk-t" class="sr-only">Target duration per chunk in seconds (estimated speech length).</span>
+          </label>
+          <label class="field">
+            <span class="lbl-row">
+              <span class="lbl" id="lbl-chunk-min">Min (sec)</span>
+              <button type="button" class="tip-btn" title="chunk_min_seconds (seconds): chunks won’t shrink below this duration except when text forces it." aria-label="Help: chunk min">ⓘ</button>
+            </span>
+            <input type="number" id="chunk-min" step="1" min="1" aria-labelledby="lbl-chunk-min" aria-describedby="sr-chunk-min" />
+            <span id="sr-chunk-min" class="sr-only">Minimum chunk duration in seconds.</span>
+          </label>
+          <label class="field">
+            <span class="lbl-row">
+              <span class="lbl" id="lbl-chunk-max">Max (sec)</span>
+              <button type="button" class="tip-btn" title="chunk_max_seconds (seconds): hard ceiling for chunk duration to avoid runaway segments." aria-label="Help: chunk max">ⓘ</button>
+            </span>
+            <input type="number" id="chunk-max" step="1" min="1" aria-labelledby="lbl-chunk-max" aria-describedby="sr-chunk-max" />
+            <span id="sr-chunk-max" class="sr-only">Maximum chunk duration in seconds.</span>
+          </label>
+        </div>
+      </section>
+
+      <details class="card adv">
+        <summary>Expert — raw <code>extra_body</code> JSON</summary>
+        <details class="section-help section-help-nested">
+          <summary>How Expert JSON merges</summary>
+          <div class="card-doc">
+            <p>Merged after form fields and preset; duplicate keys here win. Use for speaker_kv_scale, speaker_kv_min_t, speaker_kv_max_layers, custom block_sizes / num_steps, zero-tail tuning, chunk rate overrides, etc.</p>
+            <ul class="help-list">
+              <li>Must be valid JSON object or Generate is blocked.</li>
+              <li>Values pass straight into inference — typos can error or OOM.</li>
+              <li>Saved verbatim with Save settings.</li>
+            </ul>
+          </div>
+        </details>
+        <label class="field">
+          <span class="lbl-row">
+            <span class="lbl" id="lbl-extra">JSON editor</span>
+            <button type="button" class="tip-btn" title="Leave {} if using only the form. See /docs for speech schema keys." aria-label="Help: expert JSON">ⓘ</button>
+          </span>
+          <textarea id="extra" rows="8" class="code" placeholder="{ }" aria-labelledby="lbl-extra" aria-describedby="sr-extra"></textarea>
+          <span id="sr-extra" class="sr-only">Optional extra_body overrides as JSON object.</span>
+        </label>
+      </details>
+
+      <div class="actions-primary">
+        <button type="button" id="generate" class="btn primary lg">Generate speech</button>
+        <span id="status" class="status" aria-live="polite"></span>
+      </div>
+
+      <div class="btn-toolbar">
+        <button type="button" id="save-settings" class="btn secondary" title="Writes echo_ui_preferences.json on the server (ECHO_UI_PREFS_PATH)">Save settings to server</button>
+        <button type="button" id="reset-settings" class="btn secondary" title="Reloads defaults from GET /echo/ui/meta and clears Expert JSON; does not delete the prefs file until you save again">Reset form</button>
+      </div>
+      <details class="toolbar-help">
+        <summary>Save / reset · prefs file</summary>
+        <p class="toolbar-help-body">
+          <strong>Save settings</strong> writes <code>echo_ui_preferences.json</code> (override with <code>ECHO_UI_PREFS_PATH</code>). <strong>Reset form</strong> reloads defaults from <code>GET /echo/ui/meta</code> and clears Expert JSON — it does not delete the prefs file until you save again.
+        </p>
+      </details>
+
+      <audio id="player" controls class="player" hidden></audio>
+
+      <footer class="ft muted">
+        Interactive API: <code>/docs</code> · Meta / presets: <code>/echo/ui/meta</code> · Preferences API: <code>/echo/ui/preferences</code>
+      </footer>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

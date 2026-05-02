@@ -17,6 +17,7 @@ import gradio as gr
 import torch
 import torchaudio
 
+from cuda_perf import configure_cuda_performance
 from inference import (
     load_model_from_hf,
     load_fish_ae_from_hf,
@@ -26,19 +27,63 @@ from inference import (
     sample_pipeline,
     compile_model,
     compile_fish_ae,
-    sample_euler_cfg_independent_guidances
+    sample_euler_cfg_independent_guidances,
 )
 
 # --------------------------------------------------------------------
-# IF ON 8GB VRAM GPU, SET FISH_AE_DTYPE to bfloat16 and DEFAULT_SAMPLE_LATENT_LENGTH to < 640 (e.g., 576)
+# IF ON 8GB VRAM GPU, SET ECHO_FISH_DTYPE=bfloat16 and DEFAULT_SAMPLE_LATENT_LENGTH to < 640 (e.g., 576)
 
-# Configuration
-MODEL_DTYPE = torch.bfloat16
-FISH_AE_DTYPE = torch.float32
-# FISH_AE_DTYPE = torch.bfloat16 # USE THIS IF OOM ON 8GB vram GPU
+# Configuration (override with ECHO_MODEL_DTYPE / ECHO_FISH_DTYPE like api_server.py)
 
-DEFAULT_SAMPLE_LATENT_LENGTH = 640 # decrease if OOM on 8GB vram GPU
-# DEFAULT_SAMPLE_LATENT_LENGTH = 576  # (example, ~27 seconds rather than ~30; can change depending on what fits in VRAM)
+
+def _pre_ampere_from_env() -> bool:
+    raw = (os.getenv("ECHO_PRE_AMPERE") or "auto").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw == "auto":
+        try:
+            if torch.cuda.is_available():
+                major, minor = torch.cuda.get_device_capability(0)
+                return (major, minor) < (8, 0)
+        except Exception:
+            pass
+        return False
+    return False
+
+
+_PRE_AMPERE = _pre_ampere_from_env()
+
+
+def _dtype_from_env(var_name: str, default: torch.dtype) -> torch.dtype:
+    raw = (os.environ.get(var_name) or "").strip().lower()
+    if raw in ("", "none"):
+        return default
+    mapping: dict[str, torch.dtype] = {
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+    }
+    if raw not in mapping:
+        print(f"[gradio] Warning: invalid {var_name}={raw!r}, using default {default}")
+        return default
+    return mapping[raw]
+
+
+MODEL_DTYPE = _dtype_from_env(
+    "ECHO_MODEL_DTYPE",
+    torch.float16 if _PRE_AMPERE else torch.bfloat16,
+)
+FISH_AE_DTYPE = _dtype_from_env(
+    "ECHO_FISH_DTYPE",
+    torch.float16 if _PRE_AMPERE else torch.float32,
+)
+
+configure_cuda_performance()
+
+DEFAULT_SAMPLE_LATENT_LENGTH = 640  # decrease if OOM on 8GB vram GPU
 
 # NOTE peak S1-DAC decoding VRAM > peak latent sampling VRAM, so decoding in chunks (which is posisble as S1-DAC is causal) would allow for full 640-length generation on lower VRAM GPUs
 
@@ -51,12 +96,13 @@ AUDIO_PROMPT_FOLDER = Path("./audio_prompts")
 
 TEXT_PRESETS_PATH = Path("./text_presets.txt")
 SAMPLER_PRESETS_PATH = Path("./sampler_presets.json")
+USER_SAMPLER_PRESETS_PATH = Path("./user_sampler_presets.json")
 
 TEMP_AUDIO_DIR = Path("./temp_gradio_audio")
 TEMP_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
-# --------------------------------------------------------------------
-# Model loading (eager for local use)
+# Model weights (standalone Gradio only; optional legacy UI — prefer `/ui` on api_server).
+
 model = load_model_from_hf(dtype=MODEL_DTYPE, delete_blockwise_modules=True)
 fish_ae = load_fish_ae_from_hf(dtype=FISH_AE_DTYPE)
 pca_state = load_pca_state_from_hf()
@@ -451,13 +497,32 @@ def load_sampler_presets():
     return default_presets
 
 
-def apply_sampler_preset(preset_name):
-    """Apply a sampler preset to all fields."""
-    presets = load_sampler_presets()
-    if preset_name == "Custom" or preset_name not in presets:
-        return [gr.update()] * 13
+def load_user_sampler_presets() -> dict:
+    """Load user-defined presets from JSON (optional file)."""
+    if not USER_SAMPLER_PRESETS_PATH.exists():
+        return {}
+    try:
+        with open(USER_SAMPLER_PRESETS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
 
-    preset = presets[preset_name]
+
+def save_user_sampler_presets(presets: dict) -> None:
+    USER_SAMPLER_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(USER_SAMPLER_PRESETS_PATH, "w", encoding="utf-8") as f:
+        json.dump(presets, f, indent=2)
+
+
+def build_preset_dropdown_choices() -> list[str]:
+    builtin = load_sampler_presets()
+    user = load_user_sampler_presets()
+    return ["Custom"] + list(builtin.keys()) + [f"user:{k}" for k in sorted(user.keys())]
+
+
+def _preset_dict_to_sampler_updates(preset: dict) -> list:
+    """Build 13 Gradio updates from a preset dict (built-in or user)."""
     speaker_kv_enabled = to_bool(preset.get("speaker_kv_enable", False))
 
     def to_num(val, default):
@@ -481,6 +546,249 @@ def apply_sampler_preset(preset_name):
         gr.update(value=to_num(preset.get("speaker_kv_min_t", "0.9"), 0.9)),
         gr.update(value=int(to_num(preset.get("speaker_kv_max_layers", "24"), 24))),
     ]
+
+
+def _advanced_updates_from_preset(preset: dict) -> list:
+    """Six updates: compile, use_custom_shapes, custom_shapes_row visibility, max_text, max_spk_latent, sample_latent."""
+    if not preset.get("_has_advanced"):
+        return [
+            gr.update(value=False),
+            gr.update(value=False),
+            gr.update(visible=False),
+            gr.update(value="768"),
+            gr.update(value="640, 2816, 6400"),
+            gr.update(value=str(DEFAULT_SAMPLE_LATENT_LENGTH)),
+        ]
+    compile_v = bool(preset.get("compile", False))
+    use_shapes = bool(preset.get("use_custom_shapes", False))
+    if compile_v:
+        use_shapes = True
+    shapes_visible = use_shapes
+    return [
+        gr.update(value=compile_v),
+        gr.update(value=use_shapes),
+        gr.update(visible=shapes_visible),
+        gr.update(value=str(preset.get("max_text_byte_length", "768"))),
+        gr.update(value=str(preset.get("max_speaker_latent_length", "640, 2816, 6400"))),
+        gr.update(value=str(preset.get("sample_latent_length", str(DEFAULT_SAMPLE_LATENT_LENGTH)))),
+    ]
+
+
+def apply_sampler_preset(preset_name):
+    """Apply a built-in sampler preset to all fields (sampler rows only)."""
+    presets = load_sampler_presets()
+    if preset_name == "Custom" or preset_name not in presets:
+        return [gr.update()] * 13
+    return _preset_dict_to_sampler_updates(presets[preset_name])
+
+
+def apply_merged_preset(preset_name):
+    """Apply built-in or user: preset including optional advanced fields."""
+    if preset_name == "Custom":
+        return [gr.update()] * 19
+
+    if preset_name.startswith("user:"):
+        key = preset_name[5:]
+        presets = load_user_sampler_presets()
+    else:
+        key = preset_name
+        presets = load_sampler_presets()
+
+    if key not in presets:
+        return [gr.update()] * 19
+
+    raw = dict(presets[key])
+    raw["_has_advanced"] = any(
+        k in raw for k in ("compile", "use_custom_shapes", "max_text_byte_length", "sample_latent_length")
+    )
+    base = _preset_dict_to_sampler_updates(raw)
+    adv = _advanced_updates_from_preset(raw)
+    return base + adv
+
+
+def collect_preset_payload(
+    num_steps,
+    cfg_scale_text,
+    cfg_scale_speaker,
+    cfg_min_t,
+    cfg_max_t,
+    truncation_factor,
+    rescale_k,
+    rescale_sigma,
+    force_speaker,
+    speaker_kv_scale,
+    speaker_kv_min_t,
+    speaker_kv_max_layers,
+    compile_checkbox,
+    use_custom_shapes_checkbox,
+    max_text_byte_length,
+    max_speaker_latent_length,
+    sample_latent_length,
+) -> dict:
+    """Serialize current UI state for user_sampler_presets.json."""
+    return {
+        "num_steps": num_steps,
+        "cfg_scale_text": cfg_scale_text,
+        "cfg_scale_speaker": cfg_scale_speaker,
+        "cfg_min_t": cfg_min_t,
+        "cfg_max_t": cfg_max_t,
+        "truncation_factor": truncation_factor,
+        "rescale_k": rescale_k,
+        "rescale_sigma": rescale_sigma,
+        "speaker_kv_enable": bool(force_speaker),
+        "speaker_kv_scale": speaker_kv_scale,
+        "speaker_kv_min_t": speaker_kv_min_t,
+        "speaker_kv_max_layers": speaker_kv_max_layers,
+        "compile": bool(compile_checkbox),
+        "use_custom_shapes": bool(use_custom_shapes_checkbox),
+        "max_text_byte_length": max_text_byte_length,
+        "max_speaker_latent_length": max_speaker_latent_length,
+        "sample_latent_length": sample_latent_length,
+    }
+
+
+def save_user_preset_click(
+    name_raw: str,
+    num_steps,
+    cfg_scale_text,
+    cfg_scale_speaker,
+    cfg_min_t,
+    cfg_max_t,
+    truncation_factor,
+    rescale_k,
+    rescale_sigma,
+    force_speaker,
+    speaker_kv_scale,
+    speaker_kv_min_t,
+    speaker_kv_max_layers,
+    compile_checkbox,
+    use_custom_shapes_checkbox,
+    max_text_byte_length,
+    max_speaker_latent_length,
+    sample_latent_length,
+):
+    name_raw = (name_raw or "").strip()
+    if not name_raw:
+        return (
+            gr.update(value="Enter a preset name to save."),
+            gr.update(),
+        )
+    key = name_raw.removeprefix("user:")
+    builtin = load_sampler_presets()
+    if key in builtin:
+        return (
+            gr.update(value=f"Name `{key}` is reserved (built-in preset). Choose another name."),
+            gr.update(),
+        )
+    user = load_user_sampler_presets()
+    payload = collect_preset_payload(
+        num_steps,
+        cfg_scale_text,
+        cfg_scale_speaker,
+        cfg_min_t,
+        cfg_max_t,
+        truncation_factor,
+        rescale_k,
+        rescale_sigma,
+        force_speaker,
+        speaker_kv_scale,
+        speaker_kv_min_t,
+        speaker_kv_max_layers,
+        compile_checkbox,
+        use_custom_shapes_checkbox,
+        max_text_byte_length,
+        max_speaker_latent_length,
+        sample_latent_length,
+    )
+    user[key] = payload
+    save_user_sampler_presets(user)
+    sel = f"user:{key}"
+    return (
+        gr.update(value=f"Saved preset **{sel}**."),
+        gr.update(choices=build_preset_dropdown_choices(), value=sel),
+    )
+
+
+def delete_user_preset_click(preset_name: str):
+    if not preset_name or preset_name == "Custom":
+        return gr.update(value="Select a `user:…` preset or enter its name."), gr.update()
+    key = preset_name.removeprefix("user:")
+    user = load_user_sampler_presets()
+    if key not in user:
+        return gr.update(value=f"No user preset named `{key}`."), gr.update()
+    del user[key]
+    save_user_sampler_presets(user)
+    builtin = load_sampler_presets()
+    fallback = list(builtin.keys())[0] if builtin else "Custom"
+    return (
+        gr.update(value=f"Deleted user preset **user:{key}**."),
+        gr.update(choices=build_preset_dropdown_choices(), value=fallback),
+    )
+
+
+def build_extra_body_json(
+    num_steps,
+    rng_seed,
+    cfg_scale_text,
+    cfg_scale_speaker,
+    cfg_min_t,
+    cfg_max_t,
+    truncation_factor,
+    rescale_k,
+    rescale_sigma,
+    force_speaker,
+    speaker_kv_scale,
+    speaker_kv_min_t,
+    speaker_kv_max_layers,
+    use_custom_shapes,
+    max_text_byte_length,
+    compile_checkbox,
+) -> str:
+    """OpenAI-compatible `extra_body` fragment for api_server (reference only)."""
+    body: dict = {
+        "seed": int(rng_seed) if rng_seed is not None else -1,
+        "num_steps": int(num_steps),
+        "cfg_scale_text": float(cfg_scale_text),
+        "cfg_scale_speaker": float(cfg_scale_speaker),
+        "cfg_min_t": float(cfg_min_t),
+        "cfg_max_t": float(cfg_max_t),
+        "truncation_factor": float(truncation_factor),
+        "rescale_sigma": float(rescale_sigma),
+        "guidance_mode": "independent",
+    }
+    rk = float(rescale_k)
+    if rk != 1.0:
+        body["rescale_k"] = rk
+    if force_speaker:
+        body["speaker_kv_scale"] = float(speaker_kv_scale)
+        body["speaker_kv_min_t"] = float(speaker_kv_min_t)
+        body["speaker_kv_max_layers"] = int(speaker_kv_max_layers)
+    if use_custom_shapes and (max_text_byte_length or "").strip():
+        first = (max_text_byte_length or "").split(",")[0].strip()
+        if first:
+            try:
+                body["max_text_length"] = int(first)
+            except ValueError:
+                pass
+    return json.dumps(body, indent=2)
+
+
+def build_echo_env_snippet(compile_checkbox: bool) -> str:
+    """Suggested ECHO_* exports (Gradio does not change a running API process)."""
+    lines = [
+        "# Copy into shell or .env when running api_server.py (see README Server Environment Flags)",
+        f"export ECHO_COMPILE={'1' if compile_checkbox else '0'}",
+        "export ECHO_COMPILE_AE=1",
+        "# Chunking, performance preset, dtypes, VAD reroll, etc. are server env only — not OpenAI request fields.",
+        "# Examples:",
+        "# export ECHO_PERFORMANCE_PRESET=default",
+        "# export ECHO_MODEL_DTYPE=bfloat16",
+        "# export ECHO_FISH_DTYPE=float32",
+        "# Pre-Ampere / tight VRAM: try float16 and lower preset",
+        "# export ECHO_MODEL_DTYPE=float16",
+        "# export ECHO_PERFORMANCE_PRESET=low_mid",
+    ]
+    return "\n".join(lines)
 
 
 AUDIO_EXTS = {".wav", ".mp3", ".m4a", ".ogg", ".flac", ".webm", ".aac", ".opus"}
@@ -582,413 +890,509 @@ def init_session():
     return secrets.token_hex(8)
 
 
-with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
-    gr.Markdown("# Echo-TTS")
-    gr.Markdown("*Jordan Darefsky, 2025. See technical details [here](https://jordandarefsky.com/blog/2025/echo/)*")
-
-    gr.Markdown("**License Notice:** All audio outputs are subject to non-commercial use [CC-BY-NC-SA-4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/).")
-
-    gr.Markdown("**Responsible Use:** Do not use this model to impersonate real people without their explicit consent or to generate deceptive audio.")
-
-    with gr.Accordion("📖 Quick Start Instructions", open=True):
-        gr.Markdown(
-            """
-            1. Upload or record a short reference clip (or leave blank for no speaker reference).
-            2. Pick a text preset or type your own prompt.
-            3. Click **Generate Audio**.
-
-            <div class="tip-box">
-            💡 **Tip:** If the generated voice does not match the reference, enable "Force Speaker" and regenerate.
-            </div>
-            """
-        )
-
-    session_id_state = gr.State(None)
-
-    gr.Markdown("# Speaker Reference")
-    with gr.Row():
-        if AUDIO_PROMPT_FOLDER is not None and AUDIO_PROMPT_FOLDER.exists():
-            with gr.Column(scale=1, min_width=200):
-                gr.Markdown("#### Audio Library (click to load)")
-                audio_prompt_search = gr.Textbox(
-                    label="",
-                    placeholder="🔍 Search audio prompts...",
-                    lines=1,
-                    max_lines=1,
-                )
-                audio_prompt_table = gr.Dataframe(
-                    value=get_audio_prompt_files(),
-                    headers=["Filename"],
-                    datatype=["str"],
-                    row_count=(10, "dynamic"),
-                    col_count=(1, "fixed"),
-                    interactive=False,
-                    label="",
-                )
-        with gr.Column(scale=2):
-            custom_audio_input = gr.Audio(
-                sources=["upload", "microphone"],
-                type="filepath",
-                label="Speaker Reference Audio (first five minutes used; blank for no speaker reference)",
-                max_length=600,
+def build_gradio_blocks() -> gr.Blocks:
+    with gr.Blocks(title="Echo-TTS", css=LINK_CSS, js=JS_CODE) as demo:
+        gr.Markdown("# Echo-TTS")
+        gr.Markdown("*Jordan Darefsky, 2025. See technical details [here](https://jordandarefsky.com/blog/2025/echo/)*")
+    
+        gr.Markdown("**License Notice:** All audio outputs are subject to non-commercial use [CC-BY-NC-SA-4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/).")
+    
+        gr.Markdown("**Responsible Use:** Do not use this model to impersonate real people without their explicit consent or to generate deceptive audio.")
+    
+        with gr.Accordion("📖 Quick Start Instructions", open=True):
+            gr.Markdown(
+                """
+                1. Upload or record a short reference clip (or leave blank for no speaker reference).
+                2. Pick a text preset or type your own prompt.
+                3. Click **Generate Audio**.
+    
+                <div class="tip-box">
+                💡 **Tip:** If the generated voice does not match the reference, enable "Force Speaker" and regenerate.
+                </div>
+                """
             )
-
-    gr.HTML('<hr class="section-separator">')
-    gr.Markdown("# Text Prompt")
-    with gr.Accordion("Text Presets", open=True):
-        text_presets_table = gr.Dataframe(
-            value=load_text_presets(),
-            headers=["Category", "Words", "Preset Text"],
-            datatype=["str", "str", "str"],
-            row_count=(3, "dynamic"),
-            col_count=(3, "fixed"),
-            interactive=False,
-            column_widths=["12%", "6%", "82%"],
-        )
-    text_prompt = gr.Textbox(label="Text Prompt", placeholder="[S1] Enter your text prompt here...", lines=4)
-
-    gr.HTML('<hr class="section-separator">')
-    gr.Markdown("# Generation")
-
-    with gr.Row():
-        with gr.Column(scale=1):
-            pass
-        with gr.Column(scale=2):
-            mode_selector = gr.Radio(
-                choices=["Simple Mode", "Advanced Mode"],
-                value="Simple Mode",
-                label="",
-                info=None,
-                elem_id="component-mode-selector",
-            )
-        with gr.Column(scale=1):
-            pass
-
-    with gr.Accordion("⚙️ Generation Parameters", open=True):
-        with gr.Row(equal_height=False):
-            presets = load_sampler_presets()
-            preset_keys = list(presets.keys())
-            first_preset = preset_keys[0] if preset_keys else "Custom"
-
+    
+        session_id_state = gr.State(None)
+    
+        gr.Markdown("# Speaker Reference")
+        with gr.Row():
+            if AUDIO_PROMPT_FOLDER is not None and AUDIO_PROMPT_FOLDER.exists():
+                with gr.Column(scale=1, min_width=200):
+                    gr.Markdown("#### Audio Library (click to load)")
+                    audio_prompt_search = gr.Textbox(
+                        label="",
+                        placeholder="🔍 Search audio prompts...",
+                        lines=1,
+                        max_lines=1,
+                    )
+                    audio_prompt_table = gr.Dataframe(
+                        value=get_audio_prompt_files(),
+                        headers=["Filename"],
+                        datatype=["str"],
+                        row_count=(10, "dynamic"),
+                        col_count=(1, "fixed"),
+                        interactive=False,
+                        label="",
+                    )
             with gr.Column(scale=2):
-                preset_dropdown = gr.Dropdown(
-                    choices=["Custom"] + preset_keys,
-                    value=first_preset,
-                    label="Sampler Preset",
-                    info="Load preset configurations",
+                custom_audio_input = gr.Audio(
+                    sources=["upload", "microphone"],
+                    type="filepath",
+                    label="Speaker Reference Audio (first five minutes used; blank for no speaker reference)",
+                    max_length=600,
                 )
-
-            with gr.Column(scale=0.8, min_width=100):
-                num_steps = gr.Number(
-                    label="Steps",
-                    value=40,
-                    info="Sampling steps (Try 20-80)",
-                    precision=0,
-                    minimum=5,
-                    step=5,
-                    maximum=80,
-                )
-
-            with gr.Column(scale=0.8, min_width=100):
-                rng_seed = gr.Number(label="RNG Seed", value=0, info="Seed for noise", precision=0)
-
-            with gr.Column(scale=3):
-                with gr.Group():
-                    gr.HTML(
-                        """
-                    <div class="preset-inline">
-                      <span class="title">Speaker KV Attention Scaling</span>
-                    </div>
-                    """
-                    )
-                    spk_kv_preset_enable = gr.Button("", elem_id="spk_kv_enable", elem_classes=["proxy-btn"])
-                    spk_kv_preset_off = gr.Button("", elem_id="spk_kv_off", elem_classes=["proxy-btn"])
-                    force_speaker = gr.Checkbox(
-                        label='"Force Speaker" (KV scaling)',
-                        value=False,
-                        info="Enable to more strongly match the reference speaker (though higher values may degrade quality)",
-                    )
-                    with gr.Row(visible=False) as speaker_kv_row:
-                        speaker_kv_scale = gr.Number(label="KV Scale", value=1.5, info="Scale factor (>1 -> larger effect; try 1.5, 1.2, ...)", minimum=0, step=0.1)
-                        speaker_kv_min_t = gr.Number(
-                            label="KV Min t",
-                            value=0.9,
-                            info="(0-1), scale applied from steps t=1. to val",
-                            minimum=0,
-                            maximum=1,
-                            step=0.05,
-                        )
-                        speaker_kv_max_layers = gr.Number(
-                            label="Max Layers",
-                            value=24,
-                            info="(0-24), scale applied in first N layers",
-                            precision=0,
-                            minimum=0,
-                            maximum=24,
-                        )
-
-        with gr.Column(visible=False) as advanced_mode_column:
-            compile_checkbox = gr.Checkbox(
-                label="Compile Model",
-                value=False,
-                info="Compile for faster runs (~10-30% faster); forces Custom Shapes on to avoid excessive recompilation.",
+    
+        gr.HTML('<hr class="section-separator">')
+        gr.Markdown("# Text Prompt")
+        with gr.Accordion("Text Presets", open=True):
+            text_presets_table = gr.Dataframe(
+                value=load_text_presets(),
+                headers=["Category", "Words", "Preset Text"],
+                datatype=["str", "str", "str"],
+                row_count=(3, "dynamic"),
+                col_count=(3, "fixed"),
+                interactive=False,
+                column_widths=["12%", "6%", "82%"],
             )
-            use_custom_shapes_checkbox = gr.Checkbox(
-                label="Use Custom Shapes (Advanced)",
-                value=False,
-                info="Override default generation length and/or force latent and text padding (if unchecked, no padding is used and latent generation length is 640≈30s.)",
-            )
-
-            with gr.Row(visible=False) as custom_shapes_row:
-                max_text_byte_length = gr.Textbox(
-                    label="Max Text Byte Length (padded)",
-                    value="768",
-                    info="Single value or comma-separated buckets (auto-selects min >= length); 768 = max; leave blank for no padding",
-                    scale=1,
+        text_prompt = gr.Textbox(label="Text Prompt", placeholder="[S1] Enter your text prompt here...", lines=4)
+    
+        gr.HTML('<hr class="section-separator">')
+        gr.Markdown("# Generation")
+    
+        with gr.Row():
+            with gr.Column(scale=1):
+                pass
+            with gr.Column(scale=2):
+                mode_selector = gr.Radio(
+                    choices=["Simple Mode", "Advanced Mode"],
+                    value="Simple Mode",
+                    label="",
+                    info=None,
+                    elem_id="component-mode-selector",
                 )
-                max_speaker_latent_length = gr.Textbox(
-                    label="Max Speaker Latent Length (padded)",
-                    value="640, 2816, 6400",
-                    info="Single value or comma-separated buckets (auto-selects min >= length); 640≈30s, 2560≈2min, 6400≈5min (max); leave blank for no padding",
-                    scale=1,
-                )
-                sample_latent_length = gr.Textbox(
-                    label="Sample Latent Length",
-                    value=str(DEFAULT_SAMPLE_LATENT_LENGTH),
-                    info="Maximum sample latent length (640≈30s max seen during training; smaller works well for generating prefixes)",
-                    scale=1,
-                )
-
-            with gr.Row():
-                with gr.Column(scale=1):
+            with gr.Column(scale=1):
+                pass
+    
+        with gr.Accordion("⚙️ Generation Parameters", open=True):
+            with gr.Row(equal_height=False):
+                _preset_choices = build_preset_dropdown_choices()
+                _preset_value = _preset_choices[1] if len(_preset_choices) > 1 else "Custom"
+    
+                with gr.Column(scale=2):
+                    preset_dropdown = gr.Dropdown(
+                        choices=_preset_choices,
+                        value=_preset_value,
+                        label="Sampler Preset",
+                        info="Built-in presets and saved user:… presets (saved to user_sampler_presets.json).",
+                    )
+    
+                with gr.Column(scale=0.8, min_width=100):
+                    num_steps = gr.Number(
+                        label="Steps",
+                        value=40,
+                        info="Sampling steps (Try 20-80)",
+                        precision=0,
+                        minimum=5,
+                        step=5,
+                        maximum=80,
+                    )
+    
+                with gr.Column(scale=0.8, min_width=100):
+                    rng_seed = gr.Number(label="RNG Seed", value=0, info="Seed for noise", precision=0)
+    
+                with gr.Column(scale=3):
                     with gr.Group():
                         gr.HTML(
                             """
                         <div class="preset-inline">
-                          <span class="title">Truncation &amp; Temporal Rescaling</span><span class="dim">(</span>
-                          <a href="javascript:void(0)" class="preset-link" data-fire="trunc_flat">flat</a>
-                          <span class="dim">,</span>
-                          <a href="javascript:void(0)" class="preset-link" data-fire="trunc_sharp">sharp</a>
-                          <span class="dim">,</span>
-                          <a href="javascript:void(0)" class="preset-link" data-fire="trunc_baseline">baseline(sharp)</a>
-                          <span class="dim">)</span>
+                          <span class="title">Speaker KV Attention Scaling</span>
                         </div>
                         """
                         )
-                        trunc_preset_flat = gr.Button("", elem_id="trunc_flat", elem_classes=["proxy-btn"])
-                        trunc_preset_sharp = gr.Button("", elem_id="trunc_sharp", elem_classes=["proxy-btn"])
-                        trunc_preset_baseline = gr.Button("", elem_id="trunc_baseline", elem_classes=["proxy-btn"])
-                        with gr.Row():
-                            truncation_factor = gr.Number(
-                                label="Truncation Factor",
-                                value=0.8,
-                                info="Multiply initial noise (<1 helps artifacts)",
+                        spk_kv_preset_enable = gr.Button("", elem_id="spk_kv_enable", elem_classes=["proxy-btn"])
+                        spk_kv_preset_off = gr.Button("", elem_id="spk_kv_off", elem_classes=["proxy-btn"])
+                        force_speaker = gr.Checkbox(
+                            label='"Force Speaker" (KV scaling)',
+                            value=False,
+                            info="Enable to more strongly match the reference speaker (though higher values may degrade quality)",
+                        )
+                        with gr.Row(visible=False) as speaker_kv_row:
+                            speaker_kv_scale = gr.Number(label="KV Scale", value=1.5, info="Scale factor (>1 -> larger effect; try 1.5, 1.2, ...)", minimum=0, step=0.1)
+                            speaker_kv_min_t = gr.Number(
+                                label="KV Min t",
+                                value=0.9,
+                                info="(0-1), scale applied from steps t=1. to val",
                                 minimum=0,
+                                maximum=1,
                                 step=0.05,
                             )
-                            rescale_k = gr.Number(
-                                label="Rescale k", value=1.2, info="<1=sharpen, >1=flatten, 1=off", minimum=0, step=0.05
-                            )
-                            rescale_sigma = gr.Number(
-                                label="Rescale σ", value=3.0, info="Sigma parameter", minimum=0, step=0.1
-                            )
-
-                with gr.Column(scale=1):
-                    with gr.Group():
-                        gr.HTML(
-                            """
-                        <div class="preset-inline">
-                          <span class="title">CFG Guidance</span><span class="dim">(</span>
-                          <a href="javascript:void(0)" class="preset-link" data-fire="cfg_higher">higher speaker</a>
-                          <span class="dim">,</span>
-                          <a href="javascript:void(0)" class="preset-link" data-fire="cfg_large">large guidances</a>
-                          <span class="dim">)</span>
-                        </div>
-                        """
-                        )
-                        cfg_preset_higher_speaker = gr.Button("", elem_id="cfg_higher", elem_classes=["proxy-btn"])
-                        cfg_preset_large_guidances = gr.Button("", elem_id="cfg_large", elem_classes=["proxy-btn"])
-                        with gr.Row():
-                            cfg_scale_text = gr.Number(
-                                label="Text CFG Scale", value=3.0, info="Guidance strength for text", minimum=0, step=0.5
-                            )
-                            cfg_scale_speaker = gr.Number(
-                                label="Speaker CFG Scale",
-                                value=5.0,
-                                info="Guidance strength for speaker",
+                            speaker_kv_max_layers = gr.Number(
+                                label="Max Layers",
+                                value=24,
+                                info="(0-24), scale applied in first N layers",
+                                precision=0,
                                 minimum=0,
-                                step=0.5,
+                                maximum=24,
                             )
-
-                        with gr.Row():
-                            cfg_min_t = gr.Number(
-                                label="CFG Min t", value=0.5, info="(0-1), CFG applied when t >= val", minimum=0, maximum=1, step=0.05
+    
+            with gr.Row():
+                preset_save_name = gr.Textbox(
+                    label="User preset name",
+                    placeholder="my_preset (stored as user:my_preset)",
+                    scale=3,
+                )
+                save_preset_btn = gr.Button("Save preset")
+                delete_preset_btn = gr.Button("Delete user preset")
+            preset_save_status = gr.Markdown("")
+    
+            with gr.Column(visible=False) as advanced_mode_column:
+                compile_checkbox = gr.Checkbox(
+                    label="Compile Model",
+                    value=False,
+                    info="Compile for faster runs (~10-30% faster); forces Custom Shapes on to avoid excessive recompilation.",
+                )
+                use_custom_shapes_checkbox = gr.Checkbox(
+                    label="Use Custom Shapes (Advanced)",
+                    value=False,
+                    info="Override default generation length and/or force latent and text padding (if unchecked, no padding is used and latent generation length is 640≈30s.)",
+                )
+    
+                with gr.Row(visible=False) as custom_shapes_row:
+                    max_text_byte_length = gr.Textbox(
+                        label="Max Text Byte Length (padded)",
+                        value="768",
+                        info="Single value or comma-separated buckets (auto-selects min >= length); 768 = max; leave blank for no padding",
+                        scale=1,
+                    )
+                    max_speaker_latent_length = gr.Textbox(
+                        label="Max Speaker Latent Length (padded)",
+                        value="640, 2816, 6400",
+                        info="Single value or comma-separated buckets (auto-selects min >= length); 640≈30s, 2560≈2min, 6400≈5min (max); leave blank for no padding",
+                        scale=1,
+                    )
+                    sample_latent_length = gr.Textbox(
+                        label="Sample Latent Length",
+                        value=str(DEFAULT_SAMPLE_LATENT_LENGTH),
+                        info="Maximum sample latent length (640≈30s max seen during training; smaller works well for generating prefixes)",
+                        scale=1,
+                    )
+    
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        with gr.Group():
+                            gr.HTML(
+                                """
+                            <div class="preset-inline">
+                              <span class="title">Truncation &amp; Temporal Rescaling</span><span class="dim">(</span>
+                              <a href="javascript:void(0)" class="preset-link" data-fire="trunc_flat">flat</a>
+                              <span class="dim">,</span>
+                              <a href="javascript:void(0)" class="preset-link" data-fire="trunc_sharp">sharp</a>
+                              <span class="dim">,</span>
+                              <a href="javascript:void(0)" class="preset-link" data-fire="trunc_baseline">baseline(sharp)</a>
+                              <span class="dim">)</span>
+                            </div>
+                            """
                             )
-                            cfg_max_t = gr.Number(
-                                label="CFG Max t", value=1.0, info="(0-1), CFG applied when t <= val", minimum=0, maximum=1, step=0.05
+                            trunc_preset_flat = gr.Button("", elem_id="trunc_flat", elem_classes=["proxy-btn"])
+                            trunc_preset_sharp = gr.Button("", elem_id="trunc_sharp", elem_classes=["proxy-btn"])
+                            trunc_preset_baseline = gr.Button("", elem_id="trunc_baseline", elem_classes=["proxy-btn"])
+                            with gr.Row():
+                                truncation_factor = gr.Number(
+                                    label="Truncation Factor",
+                                    value=0.8,
+                                    info="Multiply initial noise (<1 helps artifacts)",
+                                    minimum=0,
+                                    step=0.05,
+                                )
+                                rescale_k = gr.Number(
+                                    label="Rescale k", value=1.2, info="<1=sharpen, >1=flatten, 1=off", minimum=0, step=0.05
+                                )
+                                rescale_sigma = gr.Number(
+                                    label="Rescale σ", value=3.0, info="Sigma parameter", minimum=0, step=0.1
+                                )
+    
+                    with gr.Column(scale=1):
+                        with gr.Group():
+                            gr.HTML(
+                                """
+                            <div class="preset-inline">
+                              <span class="title">CFG Guidance</span><span class="dim">(</span>
+                              <a href="javascript:void(0)" class="preset-link" data-fire="cfg_higher">higher speaker</a>
+                              <span class="dim">,</span>
+                              <a href="javascript:void(0)" class="preset-link" data-fire="cfg_large">large guidances</a>
+                              <span class="dim">)</span>
+                            </div>
+                            """
                             )
-
-    with gr.Row(equal_height=True):
-        audio_format = gr.Radio(choices=["wav", "mp3"], value="wav", label="Format", scale=1, min_width=90)
-        generate_btn = gr.Button("Generate Audio", variant="primary", size="lg", scale=10)
-        with gr.Column(scale=1):
-            show_original_audio = gr.Checkbox(label="Re-display Original Audio (full 5-minute cropped mono)", value=False)
-            reconstruct_first_30_seconds = gr.Checkbox(
-                label="Show Autoencoder Reconstruction (only first 30s of reference)", value=False
+                            cfg_preset_higher_speaker = gr.Button("", elem_id="cfg_higher", elem_classes=["proxy-btn"])
+                            cfg_preset_large_guidances = gr.Button("", elem_id="cfg_large", elem_classes=["proxy-btn"])
+                            with gr.Row():
+                                cfg_scale_text = gr.Number(
+                                    label="Text CFG Scale", value=3.0, info="Guidance strength for text", minimum=0, step=0.5
+                                )
+                                cfg_scale_speaker = gr.Number(
+                                    label="Speaker CFG Scale",
+                                    value=5.0,
+                                    info="Guidance strength for speaker",
+                                    minimum=0,
+                                    step=0.5,
+                                )
+    
+                            with gr.Row():
+                                cfg_min_t = gr.Number(
+                                    label="CFG Min t", value=0.5, info="(0-1), CFG applied when t >= val", minimum=0, maximum=1, step=0.05
+                                )
+                                cfg_max_t = gr.Number(
+                                    label="CFG Max t", value=1.0, info="(0-1), CFG applied when t <= val", minimum=0, maximum=1, step=0.05
+                                )
+    
+        with gr.Accordion("Export for OpenAI-compatible API (`extra_body`)", open=False):
+            gr.Markdown(
+                "Paste keys below into the JSON **`extra_body`** object when calling **`POST /v1/audio/speech`**. "
+                "Streaming defaults use **`block_sizes`** / **`num_steps`** lists; omit those to use server defaults."
             )
-
-    gr.HTML('<hr class="section-separator">')
-    with gr.Accordion("Generated Audio", open=True, visible=True) as generated_section:
-        generation_time_display = gr.Markdown("", visible=False)
-        with gr.Group(elem_classes=["generated-audio-player"]):
-            generated_audio = gr.Audio(label="Generated Audio", visible=True)
-        text_prompt_display = gr.Markdown("", visible=False)
-
-        gr.Markdown("---")
-        reference_audio_header = gr.Markdown("#### Reference Audio", visible=False)
-
-        with gr.Accordion("Original Audio (5 min Cropped Mono)", open=False, visible=False) as original_accordion:
-            original_audio = gr.Audio(label="Original Reference Audio (5 min)", visible=True)
-
-        with gr.Accordion("Autoencoder Reconstruction of First 30s of Reference", open=False, visible=False) as reference_accordion:
-            reference_audio = gr.Audio(label="Decoded Reference Audio (30s)", visible=True)
-
-    # Event handlers
-    if AUDIO_PROMPT_FOLDER is not None and AUDIO_PROMPT_FOLDER.exists():
-        audio_prompt_table.select(select_audio_prompt_file, outputs=[custom_audio_input])
-        audio_prompt_search.change(filter_audio_prompts, inputs=[audio_prompt_search], outputs=[audio_prompt_table])
-
-    text_presets_table.select(select_text_preset, outputs=text_prompt)
-
-    mode_selector.change(toggle_mode, inputs=[mode_selector], outputs=[advanced_mode_column])
-
-    force_speaker.change(update_force_row, inputs=[force_speaker], outputs=[speaker_kv_row])
-
-    def toggle_custom_shapes(enabled):
-        return gr.update(visible=enabled)
-
-    use_custom_shapes_checkbox.change(
-        toggle_custom_shapes,
-        inputs=[use_custom_shapes_checkbox],
-        outputs=[custom_shapes_row],
-    )
-
-    def on_compile_change(compile_enabled):
-        """When compile is enabled, force custom shapes to be enabled."""
-        if compile_enabled:
-            return (
-                gr.update(value=True),   # use_custom_shapes_checkbox
-                gr.update(visible=True), # custom_shapes_row
+            extra_body_btn = gr.Button("Generate extra_body JSON from current settings")
+            extra_body_output = gr.Textbox(label="extra_body JSON", lines=14)
+    
+        with gr.Accordion("Server environment (`ECHO_*`)", open=False):
+            gr.Markdown(
+                "Chunking, performance presets, model repos, VAD reroll, and dtypes are set via environment when starting the **API server process**, "
+            "not in the OpenAI request body. See README **Server Environment Flags**. "
+                "**Compile Model** below suggests `ECHO_COMPILE` (hint only — Gradio does not change a running API):"
             )
-        return (
-            gr.update(),
-            gr.update(),
+            echo_env_md = gr.Markdown(build_echo_env_snippet(False))
+    
+        with gr.Row(equal_height=True):
+            audio_format = gr.Radio(choices=["wav", "mp3"], value="wav", label="Format", scale=1, min_width=90)
+            generate_btn = gr.Button("Generate Audio", variant="primary", size="lg", scale=10)
+            with gr.Column(scale=1):
+                show_original_audio = gr.Checkbox(label="Re-display Original Audio (full 5-minute cropped mono)", value=False)
+                reconstruct_first_30_seconds = gr.Checkbox(
+                    label="Show Autoencoder Reconstruction (only first 30s of reference)", value=False
+                )
+    
+        gr.HTML('<hr class="section-separator">')
+        with gr.Accordion("Generated Audio", open=True, visible=True) as generated_section:
+            generation_time_display = gr.Markdown("", visible=False)
+            with gr.Group(elem_classes=["generated-audio-player"]):
+                generated_audio = gr.Audio(label="Generated Audio", visible=True)
+            text_prompt_display = gr.Markdown("", visible=False)
+    
+            gr.Markdown("---")
+            reference_audio_header = gr.Markdown("#### Reference Audio", visible=False)
+    
+            with gr.Accordion("Original Audio (5 min Cropped Mono)", open=False, visible=False) as original_accordion:
+                original_audio = gr.Audio(label="Original Reference Audio (5 min)", visible=True)
+    
+            with gr.Accordion("Autoencoder Reconstruction of First 30s of Reference", open=False, visible=False) as reference_accordion:
+                reference_audio = gr.Audio(label="Decoded Reference Audio (30s)", visible=True)
+    
+        # Event handlers
+        if AUDIO_PROMPT_FOLDER is not None and AUDIO_PROMPT_FOLDER.exists():
+            audio_prompt_table.select(select_audio_prompt_file, outputs=[custom_audio_input])
+            audio_prompt_search.change(filter_audio_prompts, inputs=[audio_prompt_search], outputs=[audio_prompt_table])
+    
+        text_presets_table.select(select_text_preset, outputs=text_prompt)
+    
+        mode_selector.change(toggle_mode, inputs=[mode_selector], outputs=[advanced_mode_column])
+    
+        force_speaker.change(update_force_row, inputs=[force_speaker], outputs=[speaker_kv_row])
+    
+        def toggle_custom_shapes(enabled):
+            return gr.update(visible=enabled)
+    
+        use_custom_shapes_checkbox.change(
+            toggle_custom_shapes,
+            inputs=[use_custom_shapes_checkbox],
+            outputs=[custom_shapes_row],
         )
-
-    compile_checkbox.change(
-        on_compile_change,
-        inputs=[compile_checkbox],
-        outputs=[use_custom_shapes_checkbox, custom_shapes_row],
-    )
-
-    cfg_preset_higher_speaker.click(
-        lambda: apply_cfg_preset("higher speaker"), outputs=[cfg_scale_text, cfg_scale_speaker, cfg_min_t, cfg_max_t, preset_dropdown]
-    )
-    cfg_preset_large_guidances.click(
-        lambda: apply_cfg_preset("large guidances"), outputs=[cfg_scale_text, cfg_scale_speaker, cfg_min_t, cfg_max_t, preset_dropdown]
-    )
-
-    spk_kv_preset_enable.click(lambda: apply_speaker_kv_preset("enable"), outputs=[force_speaker, speaker_kv_row, preset_dropdown])
-    spk_kv_preset_off.click(lambda: apply_speaker_kv_preset("off"), outputs=[force_speaker, speaker_kv_row, preset_dropdown])
-
-    trunc_preset_flat.click(lambda: apply_truncation_preset("flat"), outputs=[truncation_factor, rescale_k, rescale_sigma, preset_dropdown])
-    trunc_preset_sharp.click(lambda: apply_truncation_preset("sharp"), outputs=[truncation_factor, rescale_k, rescale_sigma, preset_dropdown])
-    trunc_preset_baseline.click(
-        lambda: apply_truncation_preset("baseline(sharp)"), outputs=[truncation_factor, rescale_k, rescale_sigma, preset_dropdown]
-    )
-
-    preset_dropdown.change(
-        apply_sampler_preset,
-        inputs=preset_dropdown,
-        outputs=[
-            num_steps,
-            cfg_scale_text,
-            cfg_scale_speaker,
-            cfg_min_t,
-            cfg_max_t,
-            truncation_factor,
-            rescale_k,
-            rescale_sigma,
-            force_speaker,
-            speaker_kv_row,
-            speaker_kv_scale,
-            speaker_kv_min_t,
-            speaker_kv_max_layers,
-        ],
-    )
-
-    generate_btn.click(
-        generate_audio,
-        inputs=[
-            text_prompt,
-            custom_audio_input,
-            num_steps,
-            rng_seed,
-            cfg_scale_text,
-            cfg_scale_speaker,
-            cfg_min_t,
-            cfg_max_t,
-            truncation_factor,
-            rescale_k,
-            rescale_sigma,
-            force_speaker,
-            speaker_kv_scale,
-            speaker_kv_min_t,
-            speaker_kv_max_layers,
-            reconstruct_first_30_seconds,
-            use_custom_shapes_checkbox,
-            max_text_byte_length,
-            max_speaker_latent_length,
-            sample_latent_length,
-            audio_format,
-            compile_checkbox,
-            show_original_audio,
-            session_id_state,
-        ],
-        outputs=[
-            generated_section,
-            generated_audio,
-            text_prompt_display,
-            original_audio,
-            generation_time_display,
-            reference_audio,
-            original_accordion,
-            reference_accordion,
-            reference_audio_header,
-        ],
-    )
-
-    demo.load(init_session, outputs=[session_id_state]).then(
-        lambda: apply_sampler_preset(list(load_sampler_presets().keys())[0]),
-        outputs=[
-            num_steps,
-            cfg_scale_text,
-            cfg_scale_speaker,
-            cfg_min_t,
-            cfg_max_t,
-            truncation_factor,
-            rescale_k,
-            rescale_sigma,
-            force_speaker,
-            speaker_kv_row,
-            speaker_kv_scale,
-            speaker_kv_min_t,
-            speaker_kv_max_layers,
-        ],
-    )
+    
+        def on_compile_change(compile_enabled):
+            """When compile is enabled, force custom shapes to be enabled."""
+            if compile_enabled:
+                return (
+                    gr.update(value=True),
+                    gr.update(visible=True),
+                    gr.update(value=build_echo_env_snippet(True)),
+                )
+            return (
+                gr.update(),
+                gr.update(),
+                gr.update(value=build_echo_env_snippet(False)),
+            )
+    
+        compile_checkbox.change(
+            on_compile_change,
+            inputs=[compile_checkbox],
+            outputs=[use_custom_shapes_checkbox, custom_shapes_row, echo_env_md],
+        )
+    
+        cfg_preset_higher_speaker.click(
+            lambda: apply_cfg_preset("higher speaker"), outputs=[cfg_scale_text, cfg_scale_speaker, cfg_min_t, cfg_max_t, preset_dropdown]
+        )
+        cfg_preset_large_guidances.click(
+            lambda: apply_cfg_preset("large guidances"), outputs=[cfg_scale_text, cfg_scale_speaker, cfg_min_t, cfg_max_t, preset_dropdown]
+        )
+    
+        spk_kv_preset_enable.click(lambda: apply_speaker_kv_preset("enable"), outputs=[force_speaker, speaker_kv_row, preset_dropdown])
+        spk_kv_preset_off.click(lambda: apply_speaker_kv_preset("off"), outputs=[force_speaker, speaker_kv_row, preset_dropdown])
+    
+        trunc_preset_flat.click(lambda: apply_truncation_preset("flat"), outputs=[truncation_factor, rescale_k, rescale_sigma, preset_dropdown])
+        trunc_preset_sharp.click(lambda: apply_truncation_preset("sharp"), outputs=[truncation_factor, rescale_k, rescale_sigma, preset_dropdown])
+        trunc_preset_baseline.click(
+            lambda: apply_truncation_preset("baseline(sharp)"), outputs=[truncation_factor, rescale_k, rescale_sigma, preset_dropdown]
+        )
+    
+        preset_dropdown.change(
+            apply_merged_preset,
+            inputs=preset_dropdown,
+            outputs=[
+                num_steps,
+                cfg_scale_text,
+                cfg_scale_speaker,
+                cfg_min_t,
+                cfg_max_t,
+                truncation_factor,
+                rescale_k,
+                rescale_sigma,
+                force_speaker,
+                speaker_kv_row,
+                speaker_kv_scale,
+                speaker_kv_min_t,
+                speaker_kv_max_layers,
+                compile_checkbox,
+                use_custom_shapes_checkbox,
+                custom_shapes_row,
+                max_text_byte_length,
+                max_speaker_latent_length,
+                sample_latent_length,
+            ],
+        )
+    
+        save_preset_btn.click(
+            save_user_preset_click,
+            inputs=[
+                preset_save_name,
+                num_steps,
+                cfg_scale_text,
+                cfg_scale_speaker,
+                cfg_min_t,
+                cfg_max_t,
+                truncation_factor,
+                rescale_k,
+                rescale_sigma,
+                force_speaker,
+                speaker_kv_scale,
+                speaker_kv_min_t,
+                speaker_kv_max_layers,
+                compile_checkbox,
+                use_custom_shapes_checkbox,
+                max_text_byte_length,
+                max_speaker_latent_length,
+                sample_latent_length,
+            ],
+            outputs=[preset_save_status, preset_dropdown],
+        )
+    
+        delete_preset_btn.click(
+            delete_user_preset_click,
+            inputs=[preset_dropdown],
+            outputs=[preset_save_status, preset_dropdown],
+        )
+    
+        extra_body_btn.click(
+            build_extra_body_json,
+            inputs=[
+                num_steps,
+                rng_seed,
+                cfg_scale_text,
+                cfg_scale_speaker,
+                cfg_min_t,
+                cfg_max_t,
+                truncation_factor,
+                rescale_k,
+                rescale_sigma,
+                force_speaker,
+                speaker_kv_scale,
+                speaker_kv_min_t,
+                speaker_kv_max_layers,
+                use_custom_shapes_checkbox,
+                max_text_byte_length,
+                compile_checkbox,
+            ],
+            outputs=[extra_body_output],
+        )
+    
+        generate_btn.click(
+            generate_audio,
+            inputs=[
+                text_prompt,
+                custom_audio_input,
+                num_steps,
+                rng_seed,
+                cfg_scale_text,
+                cfg_scale_speaker,
+                cfg_min_t,
+                cfg_max_t,
+                truncation_factor,
+                rescale_k,
+                rescale_sigma,
+                force_speaker,
+                speaker_kv_scale,
+                speaker_kv_min_t,
+                speaker_kv_max_layers,
+                reconstruct_first_30_seconds,
+                use_custom_shapes_checkbox,
+                max_text_byte_length,
+                max_speaker_latent_length,
+                sample_latent_length,
+                audio_format,
+                compile_checkbox,
+                show_original_audio,
+                session_id_state,
+            ],
+            outputs=[
+                generated_section,
+                generated_audio,
+                text_prompt_display,
+                original_audio,
+                generation_time_display,
+                reference_audio,
+                original_accordion,
+                reference_accordion,
+                reference_audio_header,
+            ],
+        )
+    
+        demo.load(init_session, outputs=[session_id_state]).then(
+            lambda: apply_merged_preset(
+                build_preset_dropdown_choices()[1] if len(build_preset_dropdown_choices()) > 1 else "Custom"
+            ),
+            outputs=[
+                num_steps,
+                cfg_scale_text,
+                cfg_scale_speaker,
+                cfg_min_t,
+                cfg_max_t,
+                truncation_factor,
+                rescale_k,
+                rescale_sigma,
+                force_speaker,
+                speaker_kv_row,
+                speaker_kv_scale,
+                speaker_kv_min_t,
+                speaker_kv_max_layers,
+                compile_checkbox,
+                use_custom_shapes_checkbox,
+                custom_shapes_row,
+                max_text_byte_length,
+                max_speaker_latent_length,
+                sample_latent_length,
+            ],
+        )
+    return demo
 
 
 if __name__ == "__main__":
-    demo.launch(
-        allowed_paths=[str(AUDIO_PROMPT_FOLDER)]
-    )
+    demo = build_gradio_blocks()
+    demo.launch(allowed_paths=[str(AUDIO_PROMPT_FOLDER.resolve())])
