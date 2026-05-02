@@ -14,6 +14,7 @@ FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04
 # Volta (V100, sm_70): PyTorch must be CUDA 12.6 wheels (cu126). Official cu128/cu130 Linux
 # binaries omit sm_70 — see https://github.com/pytorch/pytorch/blob/main/RELEASE.md
 # torchcodec probes FFmpeg 8→4; noble ships FFmpeg 6. libtorchcodec_custom_ops*.so needs libpython (python3-dev); see meta-pytorch/torchcodec#1164.
+# torch.compile → Inductor/Triton JIT needs a C compiler at runtime (first inference) unless graphs are fully cached.
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -22,6 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
     python3 \
     python3-pip \
     python3-venv \

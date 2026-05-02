@@ -266,7 +266,7 @@ On other GPUs you can still follow [pytorch.org](https://pytorch.org/get-started
 
 Image: **CUDA 12.6** runtime on **Ubuntu 24.04**. **`torch` / `torchaudio` are installed from the `cu126` index only** (Volta-safe; avoids pulling default PyPI CUDA builds that skip sm_70). Requires a host NVIDIA driver that supports CUDA 12.x.
 
-The image installs **`ffmpeg`** from apt, **`python3-dev`** (so **torchcodec** can resolve **`libpython3.12`**, which its ops `.so` links), and sets **`LD_LIBRARY_PATH`** to **`/usr/lib/x86_64-linux-gnu`** (and **`/lib/x86_64-linux-gnu`**). At import time, torchcodec may try FFmpeg **8→7** first and log missing **`libavutil.so.60`** / **`.59`**; on Ubuntu **24.04** it should succeed with the **FFmpeg 6** build once **`libpython`** is visible.
+The image installs **`ffmpeg`** from apt, **`python3-dev`** (so **torchcodec** can resolve **`libpython3.12`**, which its ops `.so` links), **`build-essential`** (**`gcc`**) for **torch.compile** / **Triton**’s first‑run JIT, and sets **`LD_LIBRARY_PATH`** to **`/usr/lib/x86_64-linux-gnu`** (and **`/lib/x86_64-linux-gnu`**). At import time, torchcodec may try FFmpeg **8→7** first and log missing **`libavutil.so.60`** / **`.59`**; on Ubuntu **24.04** it should succeed with the **FFmpeg 6** build once **`libpython`** is visible. On Ampere+, **`ECHO_COMPILE_AE`** defaults to **on** (Fish AE quantizer); set **`ECHO_COMPILE_AE=0`** if you must run without a compiler (slower speaker encode).
 
 Build:
 
